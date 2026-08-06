@@ -7,6 +7,37 @@ fn broker_input(include_year_to_date: bool, quote_source: Option<&str>) -> Broke
 }
 
 #[test]
+fn project_broker_overview_exposes_only_supported_return_fields() {
+    let input = broker_input(false, None);
+    let response = json!({
+        "account": {
+            "brokerPortfolio": {
+                "valuation": {
+                    "valuation": 1234.56,
+                    "securitiesValuation": 1200.00,
+                    "cryptoValuation": 34.56,
+                    "timeWeightedReturnByTimeframe": [{
+                        "timeframe": "ONE_WEEK",
+                        "performance": 0,
+                        "simpleAbsoluteReturn": 12.34
+                    }]
+                }
+            }
+        }
+    });
+
+    let projected = project_broker_overview_response(&input, &response).expect("project");
+
+    assert_eq!(
+        projected["performance"],
+        json!([{
+            "timeframe": "ONE_WEEK",
+            "simpleAbsoluteReturn": 12.34
+        }])
+    );
+}
+
+#[test]
 fn project_broker_analytics_maps_result_sections() {
     let input = broker_input(false, None);
     let response = json!({
@@ -1479,6 +1510,9 @@ fn project_broker_savings_plan_config_extracts_config() {
         "account": {
             "brokerPortfolio": {
                 "security": {
+                    "isin": "US0378331005",
+                    "name": "Apple",
+                    "type": "STOCK",
                     "savingsPlanConfiguration": {
                         "frequencies": ["MONTHLY"]
                     }
@@ -1491,6 +1525,59 @@ fn project_broker_savings_plan_config_extracts_config() {
 }
 
 #[test]
+fn project_broker_savings_plan_config_details_preserves_security_wrapper() {
+    let response = json!({
+        "account": {
+            "brokerPortfolio": {
+                "security": {
+                    "isin": "US0378331005",
+                    "name": "Apple",
+                    "type": "STOCK",
+                    "savingsPlanConfiguration": {
+                        "frequencies": ["MONTHLY"]
+                    }
+                }
+            }
+        }
+    });
+
+    let projected = project_broker_savings_plan_config_details_response("US0378331005", &response)
+        .expect("project");
+    assert_eq!(projected["security"]["isin"], "US0378331005");
+    assert_eq!(projected["security"]["name"], "Apple");
+    assert_eq!(projected["security"]["security_type"], "STOCK");
+    assert_eq!(
+        projected["savings_plan_configuration"]["frequencies"][0],
+        "MONTHLY"
+    );
+}
+
+#[test]
+fn project_broker_savings_plan_config_details_rejects_isin_mismatch() {
+    let response = json!({
+        "account": {
+            "brokerPortfolio": {
+                "security": {
+                    "isin": "DE000A1EWWW0",
+                    "name": "Wrong Security",
+                    "type": "ETF",
+                    "savingsPlanConfiguration": {
+                        "frequencies": ["MONTHLY"]
+                    }
+                }
+            }
+        }
+    });
+
+    let err =
+        project_broker_savings_plan_config_details_response("US0378331005", &response).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("does not match returned security isin")
+    );
+}
+
+#[test]
 fn project_broker_create_or_update_savings_plan_response_maps_mutation_id() {
     let response = json!({
         "createOrUpdateSavingsPlan": {
@@ -1500,6 +1587,23 @@ fn project_broker_create_or_update_savings_plan_response_maps_mutation_id() {
     let projected =
         project_broker_create_or_update_savings_plan_response(&response).expect("project");
     assert_eq!(projected["mutation_id"], "mutation-1");
+}
+
+#[test]
+fn project_broker_create_or_update_savings_plan_response_rejects_malformed_acknowledgements() {
+    for response in [
+        json!({"createOrUpdateSavingsPlan": null}),
+        json!({"createOrUpdateSavingsPlan": {}}),
+        json!({"createOrUpdateSavingsPlan": {"id": "   "}}),
+        json!({"createOrUpdateSavingsPlan": "mutation-1"}),
+    ] {
+        let err = project_broker_create_or_update_savings_plan_response(&response)
+            .expect_err("malformed acknowledgement must be rejected");
+        assert!(
+            err.to_string()
+                .contains("Broker response invalid: missing createOrUpdateSavingsPlan")
+        );
+    }
 }
 
 #[test]

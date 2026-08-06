@@ -33,7 +33,8 @@ Selenium, browser scraping, or brittle UI scripts.
 
 - Use supported broker commands instead of browser automation or screen scraping.
 - Work interactively in the terminal or use `--json` for local scripts and agent workflows.
-- Review trades before submission with an explicit two-step confirmation flow.
+- Review trades and savings-plan changes before submission with an explicit
+  two-step confirmation flow.
 
 ## Install
 
@@ -220,6 +221,24 @@ sc whoami
 sc logout
 ```
 
+### Overnight savings
+
+```bash
+sc overnight
+sc overnight --savings-account-id <SAVINGS_ACCOUNT_ID>
+sc overnight transactions --page-size 50 --type-filter interest
+sc overnight transactions --savings-account-id <SAVINGS_ACCOUNT_ID> --json
+```
+
+`sc overnight` shows the dedicated overnight savings summary. It
+auto-resolves the savings account when exactly one active account is accessible;
+otherwise, provide `--savings-account-id`.
+
+`sc overnight transactions` lists the deposits, withdrawals, interest, and
+other cash transactions for the selected overnight account. It supports cursor
+pagination, repeatable `--type-filter`, text search, and time-window filters.
+Run `sc overnight transactions --help` for all available filters.
+
 ### Portfolio and market data
 
 ```bash
@@ -228,6 +247,8 @@ sc broker analytics
 sc broker transactions
 sc broker transaction details --transaction-id <TRANSACTION_ID>
 sc broker holdings
+sc broker portfolio-groups
+sc broker portfolio-groups --group-id <GROUP_ID>
 sc broker chart --isin US0378331005 --timeframe 1m
 sc broker quote --isin US0378331005
 sc broker watchlist
@@ -235,6 +256,31 @@ sc broker search "apple"
 sc broker derivatives search --underlying US0378331005 --type knockout --strategy long
 sc broker security-news --isin US0378331005 --locale en_DE
 ```
+
+`sc broker overview` reports the absolute return (`simpleAbsoluteReturn`) for
+each available timeframe. It does not report a relative return percentage.
+
+`sc broker portfolio-groups` returns all groups, their items, group-level since-buy
+performance, and ungrouped holdings. Add `--group-id <GROUP_ID>` to narrow the
+result to one existing group; filtered reads keep the same JSON shape but return
+an empty `ungrouped_items` list.
+
+Manage group metadata with lifecycle commands. `update` changes only the supplied
+fields; use `--clear-description` to remove an existing description.
+
+```bash
+sc broker portfolio-groups create --name "AI portfolio" --description "tracked by agent"
+sc broker portfolio-groups update --group-id <GROUP_ID> --name "Long-term portfolio"
+sc broker portfolio-groups update --group-id <GROUP_ID> --clear-description
+sc broker portfolio-groups delete --group-id <GROUP_ID>
+sc broker portfolio-groups assign --group-id <GROUP_ID> --isin US0378331005 --isin IE00B4ND3602
+sc broker portfolio-groups unassign --group-id <GROUP_ID> --isin US0378331005
+```
+
+`assign` moves each supplied holding into the target group, automatically removing it
+from any other group. `unassign` removes holdings from the named group and returns them
+to the ungrouped holdings list. Assigning a holding already in the target group, or
+unassigning one that is not in it, returns a validation error.
 
 `sc broker derivatives search` supports derivative discovery for a known
 underlying ISIN. The selected derivative ISIN can then be quoted with
@@ -251,9 +297,24 @@ sc broker price-alerts add --isin US0378331005 --price 180.00
 sc broker price-alerts add --ticker BTC --price 45000.00
 sc broker price-alerts remove --alert-id <ALERT_ID>
 sc broker savings-plans
+sc broker savings-plans config --isin US0378331005
+# Phase 1: preview; this does not create or update a plan.
 sc broker savings-plans add --isin US0378331005 --amount 100
+# Phase 2: run only after a separate affirmative client confirmation.
+sc broker savings-plans add --isin US0378331005 --amount 100 --confirm <CONFIRMATION_ID>
 sc broker savings-plans remove --isin US0378331005
 ```
+
+Savings-plan additions and updates are intentionally two-step. Phase 1 returns
+the full ex-ante cost disclosure calculated for `MUNC`, together with a
+short-lived confirmation ID. Present every value in that disclosure to the
+client, obtain an explicit affirmative response in a separate interaction,
+then repeat the exact arguments with `--confirm <CONFIRMATION_ID>`.
+
+If phase 2 has an unknown outcome, do not retry it. Run
+`sc broker savings-plans` for the same account and portfolio to inspect the
+result; only that successful list clears the local safety gate for a later,
+deliberately new preview.
 
 ### Broker context
 
@@ -270,6 +331,7 @@ Run the command once to preview the order and receive a confirmation ID:
 
 ```bash
 sc broker trade buy --isin US0378331005 --amount 500 --order-type market
+sc broker trade buy --isin US0378331005 --shares 2 --order-type market
 ```
 
 Submit the exact same order with `--confirm` to place it:
@@ -277,9 +339,14 @@ Submit the exact same order with `--confirm` to place it:
 ```bash
 sc broker trade buy --isin US0378331005 --amount 500 --order-type market \
   --confirm <CONFIRMATION_ID>
+sc broker trade buy --isin US0378331005 --shares 2 --order-type market \
+  --confirm <CONFIRMATION_ID>
 ```
 
 If phase 1 explicitly requires unsuitable acknowledgement for the buy order, `--accept-unsuitable` confirms that you are aware of the risks and still want to proceed.
+
+Buy orders require exactly one sizing input: `--amount` or `--shares`. Buy-side
+share input currently accepts whole shares only.
 
 The same confirmation model applies to sell orders:
 

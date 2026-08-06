@@ -100,6 +100,31 @@ pub fn execute_graphql<T: Serialize>(
     )
 }
 
+/// Executes exactly one GraphQL HTTP request. Mutations that may have a
+/// non-idempotent effect use this instead of the normal nonce-retrying path.
+pub(crate) fn execute_graphql_once<T: Serialize>(
+    endpoint: &str,
+    token: &str,
+    query: &str,
+    variables: &T,
+    operation_name: Option<&str>,
+    access_context: GraphqlAccessContext,
+    dpop_options: &DpopRuntimeOptions,
+) -> Result<Value> {
+    let dpop = GraphqlDpopContext::from_runtime_options(dpop_options)?;
+    execute_graphql_with_headers_with_retry_policy(
+        endpoint,
+        token,
+        query,
+        variables,
+        operation_name,
+        access_context,
+        &[],
+        &dpop,
+        false,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn execute_graphql_with_headers<T: Serialize>(
     endpoint: &str,
@@ -135,6 +160,31 @@ fn execute_graphql_with_headers_with_context<T: Serialize>(
     headers: &[(&str, &str)],
     dpop: &GraphqlDpopContext,
 ) -> Result<Value> {
+    execute_graphql_with_headers_with_retry_policy(
+        endpoint,
+        token,
+        query,
+        variables,
+        operation_name,
+        access_context,
+        headers,
+        dpop,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_graphql_with_headers_with_retry_policy<T: Serialize>(
+    endpoint: &str,
+    token: &str,
+    query: &str,
+    variables: &T,
+    operation_name: Option<&str>,
+    access_context: GraphqlAccessContext,
+    headers: &[(&str, &str)],
+    dpop: &GraphqlDpopContext,
+    retry_dpop_nonce: bool,
+) -> Result<Value> {
     enforce_graphql_access_policy(query, operation_name, access_context)?;
     let validated_endpoint = validate_https_url(endpoint, "graphql_url")
         .with_context(|| format!("Invalid GraphQL endpoint URL: {endpoint}"))?
@@ -148,7 +198,7 @@ fn execute_graphql_with_headers_with_context<T: Serialize>(
     };
 
     let mut nonce = None::<String>;
-    for attempt in 0..2 {
+    for attempt in 0..=usize::from(retry_dpop_nonce) {
         let mut request = client
             .post(&validated_endpoint)
             .header(CONTENT_TYPE, "application/json");
@@ -176,7 +226,10 @@ fn execute_graphql_with_headers_with_context<T: Serialize>(
                 );
             }
             let text = response.text().unwrap_or_default();
-            if attempt == 0 && should_retry_with_dpop_nonce(status, retry_nonce.as_deref(), &text) {
+            if retry_dpop_nonce
+                && attempt == 0
+                && should_retry_with_dpop_nonce(status, retry_nonce.as_deref(), &text)
+            {
                 nonce = retry_nonce;
                 continue;
             }
@@ -212,7 +265,7 @@ fn execute_graphql_with_headers_with_context<T: Serialize>(
     unreachable!("GraphQL retry loop should always return");
 }
 
-fn enforce_graphql_access_policy(
+pub(crate) fn enforce_graphql_access_policy(
     query: &str,
     operation_name: Option<&str>,
     access_context: GraphqlAccessContext,
@@ -304,7 +357,19 @@ fn broker_graphql_application_error_message(
     operation_name: Option<&str>,
     errors: &Value,
 ) -> Option<String> {
+    let validation_error_code = graphql_validation_error_code(errors);
     match operation_name {
+        Some(
+            "BrokerSavingsPlanConfig"
+            | "BrokerSavingsPlanByIsin"
+            | "BrokerSavingsPlanExAnteCost"
+            | "BrokerCreateOrUpdateSavingsPlan"
+            | "BrokerRemoveSavingsPlan",
+        ) if graphql_error_code(errors).as_deref() == Some("BAD_USER_INPUT")
+            && graphql_error_message_text(errors).as_deref() == Some("Invalid ISIN provided") =>
+        {
+            Some("SAVINGS_PLAN_INPUT_INVALID: field 'isin' must be a valid ISIN".to_string())
+        }
         Some("BrokerQuote")
             if graphql_error_code(errors).as_deref() == Some("BAD_USER_INPUT")
                 && graphql_error_message_text(errors).as_deref()
@@ -313,10 +378,99 @@ fn broker_graphql_application_error_message(
             Some("Broker input invalid: field 'isin' must be a valid ISIN".to_string())
         }
         Some("BrokerTransactionDetails")
-            if graphql_validation_error_code(errors).as_deref() == Some("TransactionNotFound") =>
+            if validation_error_code.as_deref() == Some("TransactionNotFound") =>
         {
             Some("Broker transaction not found: field 'transaction_id' was not found".to_string())
         }
+        Some(
+            "BrokerCreatePortfolioGroup"
+            | "BrokerUpdatePortfolioGroup"
+            | "BrokerDeletePortfolioGroup"
+            | "BrokerAssignPortfolioGroupItems"
+            | "BrokerUnassignPortfolioGroupItems",
+        ) => portfolio_groups_graphql_application_error_message(
+            validation_error_code.as_deref(),
+            errors,
+            graphql_error_message_text(errors).as_deref(),
+        ),
+        _ => None,
+    }
+}
+
+fn portfolio_groups_graphql_application_error_message(
+    validation_error_code: Option<&str>,
+    errors: &Value,
+    backend_message: Option<&str>,
+) -> Option<String> {
+    let backend_message = backend_message.unwrap_or("Backend rejected the portfolio group request");
+    match validation_error_code {
+        Some("PortfolioGroupNotFound") => Some(format!(
+            "{} field 'group_id' was not found",
+            crate::broker_shared::BROKER_PORTFOLIO_GROUP_NOT_FOUND_ERROR_PREFIX
+        )),
+        Some("PortfolioGroupDisallowedCharacters") => {
+            let field = graphql_validation_error_detail(errors, "field")
+                .unwrap_or_else(|| "<unspecified>".to_string());
+            let disallowed_characters =
+                graphql_validation_error_detail(errors, "disallowedCharacters")
+                    .unwrap_or_else(|| "<unspecified>".to_string());
+            Some(format!(
+                "{} field '{field}', disallowed_characters '{disallowed_characters}': {backend_message}",
+                crate::broker_shared::BROKER_PORTFOLIO_GROUP_INVALID_CHARACTERS_ERROR_PREFIX
+            ))
+        }
+        Some("PortfolioGroupValidation") => {
+            Some(format!("Broker input invalid: {backend_message}"))
+        }
+        Some("PortfolioGroupsQuotaExceeded") => Some(format!(
+            "{} {backend_message}",
+            crate::broker_shared::BROKER_PORTFOLIO_GROUPS_QUOTA_EXCEEDED_ERROR_PREFIX
+        )),
+        Some("PortfolioGroupsLimitReached") => Some(format!(
+            "{} {backend_message}",
+            crate::broker_shared::BROKER_PORTFOLIO_GROUPS_LIMIT_REACHED_ERROR_PREFIX
+        )),
+        Some("GroupAlreadyExists") => Some(format!(
+            "{} {backend_message}",
+            crate::broker_shared::BROKER_PORTFOLIO_GROUP_ALREADY_EXISTS_ERROR_PREFIX
+        )),
+        Some("PortfolioGroupCannotBeRemoved") => Some(format!(
+            "{} {backend_message}",
+            crate::broker_shared::BROKER_PORTFOLIO_GROUP_CANNOT_BE_REMOVED_ERROR_PREFIX
+        )),
+        Some("BAD_REQUEST") => Some(format!("Broker input invalid: {backend_message}")),
+        _ => None,
+    }
+}
+
+fn graphql_validation_error_detail(errors: &Value, key: &str) -> Option<String> {
+    let first = errors.as_array().and_then(|items| items.first())?;
+    let validation_errors = first.get("validationErrors").or_else(|| {
+        first
+            .get("extensions")
+            .and_then(|extensions| extensions.get("validationErrors"))
+    })?;
+    extract_validation_error_detail(validation_errors, key)
+}
+
+fn extract_validation_error_detail(value: &Value, key: &str) -> Option<String> {
+    match value {
+        Value::Object(map) => map
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| {
+                map.values()
+                    .find_map(|value| extract_validation_error_detail(value, key))
+            }),
+        Value::Array(items) => items.iter().find_map(|item| {
+            item.get("field")
+                .filter(|field| field.as_str() == Some(key))
+                .and_then(|item| item.get("code"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| extract_validation_error_detail(item, key))
+        }),
         _ => None,
     }
 }
@@ -772,6 +926,37 @@ mod tests {
     }
 
     #[test]
+    fn non_replaying_graphql_path_does_not_retry_dpop_nonce_challenge() {
+        let mut server = Server::new();
+        let first = server
+            .mock("POST", "/graphql")
+            .with_status(401)
+            .with_header("DPoP-Nonce", "nonce-1")
+            .with_body(r#"{"error":"use_dpop_nonce"}"#)
+            .expect(1)
+            .create();
+        let dpop = GraphqlDpopContext::with_key_material_for_tests(
+            DpopKeyMaterial::from_private_scalar_bytes([8_u8; 32]).expect("fixed dpop key"),
+        );
+
+        let err = execute_graphql_with_headers_with_retry_policy(
+            &format!("{}/graphql", server.url()),
+            "token-1",
+            "mutation OneShot { ok }",
+            &json!({}),
+            Some("OneShot"),
+            GraphqlAccessContext::default(),
+            &[],
+            &dpop,
+            false,
+        )
+        .expect_err("one-shot mutation must not replay nonce challenges");
+
+        assert!(err.to_string().contains("GraphQL HTTP error 401"));
+        first.assert();
+    }
+
+    #[test]
     fn execute_graphql_with_headers_adds_dpop_clock_hint_when_proof_is_rejected() {
         let mut server = Server::new();
         let first = server
@@ -985,6 +1170,31 @@ mod tests {
     }
 
     #[test]
+    fn graphql_application_error_message_maps_savings_plan_bad_user_input() {
+        for operation_name in [
+            "BrokerSavingsPlanConfig",
+            "BrokerSavingsPlanByIsin",
+            "BrokerCreateOrUpdateSavingsPlan",
+            "BrokerRemoveSavingsPlan",
+        ] {
+            let message = graphql_application_error_message(
+                Some(operation_name),
+                &json!([{
+                    "message": "Invalid ISIN provided",
+                    "extensions": {
+                        "code": "BAD_USER_INPUT"
+                    }
+                }]),
+            );
+
+            assert_eq!(
+                message,
+                "SAVINGS_PLAN_INPUT_INVALID: field 'isin' must be a valid ISIN"
+            );
+        }
+    }
+
+    #[test]
     fn graphql_application_error_message_preserves_generic_broker_quote_bad_user_input_without_isin_marker()
      {
         let message = graphql_application_error_message(
@@ -1021,6 +1231,89 @@ mod tests {
         assert_eq!(
             message,
             "Broker transaction not found: field 'transaction_id' was not found"
+        );
+    }
+
+    #[test]
+    fn graphql_application_error_message_maps_portfolio_group_validation_codes() {
+        let cases = [
+            (
+                "PortfolioGroupNotFound",
+                "field 'group_id' was not found",
+                "Broker portfolio group not found: field 'group_id' was not found",
+            ),
+            (
+                "PortfolioGroupDisallowedCharacters",
+                "name contains '@'",
+                "Broker portfolio group invalid characters: field '<unspecified>', disallowed_characters '<unspecified>': name contains '@'",
+            ),
+            (
+                "PortfolioGroupValidation",
+                "name is invalid",
+                "Broker input invalid: name is invalid",
+            ),
+            (
+                "PortfolioGroupsQuotaExceeded",
+                "offer does not allow another group",
+                "Broker portfolio groups quota exceeded: offer does not allow another group",
+            ),
+            (
+                "PortfolioGroupsLimitReached",
+                "technical maximum reached",
+                "Broker portfolio groups limit reached: technical maximum reached",
+            ),
+            (
+                "GroupAlreadyExists",
+                "Group already exists",
+                "Broker portfolio group already exists: Group already exists",
+            ),
+            (
+                "PortfolioGroupCannotBeRemoved",
+                "The portfolio group cannot be removed",
+                "Broker portfolio group cannot be removed: The portfolio group cannot be removed",
+            ),
+            (
+                "BAD_REQUEST",
+                "Bad Request",
+                "Broker input invalid: Bad Request",
+            ),
+        ];
+
+        for operation_name in [
+            "BrokerCreatePortfolioGroup",
+            "BrokerAssignPortfolioGroupItems",
+            "BrokerUnassignPortfolioGroupItems",
+        ] {
+            for (error_code, backend_message, expected) in cases {
+                let message = graphql_application_error_message(
+                    Some(operation_name),
+                    &json!([{
+                        "message": backend_message,
+                        "extensions": {"validationErrors": {"errorCode": error_code}},
+                    }]),
+                );
+                assert_eq!(message, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn graphql_application_error_message_surfaces_portfolio_group_character_details() {
+        let message = graphql_application_error_message(
+            Some("BrokerUpdatePortfolioGroup"),
+            &json!([{
+                "message": "The `name` has invalid characters.",
+                "validationErrors": {
+                    "errorCode": "PortfolioGroupDisallowedCharacters",
+                    "field": "name",
+                    "disallowedCharacters": "123!@"
+                }
+            }]),
+        );
+
+        assert_eq!(
+            message,
+            "Broker portfolio group invalid characters: field 'name', disallowed_characters '123!@': The `name` has invalid characters."
         );
     }
 

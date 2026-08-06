@@ -140,7 +140,6 @@ query BrokerOverview(
         }
         timeWeightedReturnByTimeframe {
           timeframe
-          performance
           simpleAbsoluteReturn
         }
       }
@@ -1148,6 +1147,8 @@ query BrokerSavingsPlanConfig($accountId: ID!, $portfolioId: ID!, $isin: ID!) {
     brokerPortfolio(id: $portfolioId) {
       security(isin: $isin) {
         isin
+        name
+        type
         savingsPlanConfiguration {
           schedules {
             dayOfTheMonth
@@ -1170,6 +1171,40 @@ query BrokerSavingsPlanConfig($accountId: ID!, $portfolioId: ID!, $isin: ID!) {
             epochDay
           }
         }
+      }
+    }
+  }
+}
+"#;
+
+pub const BROKER_SAVINGS_PLAN_EX_ANTE_COSTS_QUERY: &str = r#"
+query BrokerSavingsPlanExAnteCost($accountId: ID!, $portfolioId: ID!, $isin: String!, $frequency: SavingsPlanFrequency!, $amount: PositiveBigDecimal!, $venue: TradingVenue!) {
+  account(id: $accountId) {
+    brokerPortfolio(id: $portfolioId) {
+      savingsPlanExAnteCosts(input: { isin: $isin, frequency: $frequency, amount: $amount, venue: $venue }) {
+        id
+        entryCosts {
+          productCosts { amount percentage }
+          serviceCosts { amount percentage }
+          total { amount percentage }
+        }
+        ongoingCosts {
+          productCosts { amount percentage }
+          serviceCosts { amount percentage }
+          total { amount percentage }
+        }
+        exitCosts {
+          productCosts { amount percentage }
+          serviceCosts { amount percentage }
+          total { amount percentage }
+        }
+        effectOnReturn {
+          initialYearCosts { amount percentage }
+          followingYearsCosts { amount percentage }
+          finalYearCosts { amount percentage }
+        }
+        fiveYearsCosts { amount percentage }
+        incidentalCosts { amount percentage }
       }
     }
   }
@@ -1472,12 +1507,7 @@ pub fn broker_remove_savings_plan_variables(portfolio_id: &str, isin: &str) -> R
             "Broker input invalid: field 'portfolio_id' must be a non-empty string"
         ));
     }
-    let isin = isin.trim();
-    if isin.is_empty() {
-        return Err(anyhow!(
-            "Broker input invalid: field 'isin' must be a non-empty string"
-        ));
-    }
+    let isin = normalize_broker_isin(isin, "isin")?;
 
     Ok(json!({
         "portfolioId": portfolio_id,
@@ -1826,16 +1856,34 @@ pub fn broker_savings_plans_variables(input: &BrokerInput) -> Result<Value> {
 }
 
 pub fn broker_savings_plan_config_variables(input: &BrokerInput, isin: &str) -> Result<Value> {
-    let isin = isin.trim();
-    if isin.is_empty() {
+    let isin = normalize_broker_isin(isin, "isin")?;
+    Ok(json!({
+        "accountId": input.account_id,
+        "portfolioId": input.portfolio_id,
+        "isin": isin,
+    }))
+}
+
+pub fn broker_savings_plan_ex_ante_cost_variables(
+    input: &BrokerInput,
+    isin: &str,
+    frequency: &str,
+    amount: &str,
+) -> Result<Value> {
+    let isin = normalize_broker_isin(isin, "isin")?;
+    let frequency = frequency.trim();
+    if frequency.is_empty() {
         return Err(anyhow!(
-            "Broker input invalid: field 'isin' must be a non-empty string"
+            "Broker input invalid: field 'frequency' must be a non-empty string"
         ));
     }
     Ok(json!({
         "accountId": input.account_id,
         "portfolioId": input.portfolio_id,
         "isin": isin,
+        "frequency": frequency,
+        "amount": normalize_positive_decimal_with_field(amount, "amount")?,
+        "venue": "MUNC",
     }))
 }
 
@@ -1862,12 +1910,7 @@ pub fn broker_create_or_update_savings_plan_variables(
             "Broker input invalid: field 'portfolio_id' must be a non-empty string"
         ));
     }
-    let isin = isin.trim();
-    if isin.is_empty() {
-        return Err(anyhow!(
-            "Broker input invalid: field 'isin' must be a non-empty string"
-        ));
-    }
+    let isin = normalize_broker_isin(isin, "isin")?;
     if day_of_month == 0 || day_of_month > 31 {
         return Err(anyhow!(
             "Broker input invalid: field 'day_of_month' must be between 1 and 31"
@@ -2592,7 +2635,7 @@ fn format_enum_filter_help(prefix: &str, allowed: &[&str], normalization_hint: &
     format!("{prefix}: {}. {normalization_hint}", allowed.join(", "))
 }
 
-fn normalize_broker_isin(raw: &str, field: &str) -> Result<String> {
+pub(crate) fn normalize_broker_isin(raw: &str, field: &str) -> Result<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Err(anyhow!(

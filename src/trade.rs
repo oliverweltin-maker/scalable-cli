@@ -294,6 +294,38 @@ fn required_positive_decimal(value: f64, field: &str) -> Result<f64> {
     Ok(value)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum NumberOfShares {
+    Decimal(f64),
+    Whole(u64),
+}
+
+impl NumberOfShares {
+    pub fn as_f64(self) -> f64 {
+        match self {
+            Self::Decimal(value) => value,
+            Self::Whole(value) => value as f64,
+        }
+    }
+
+    fn to_json_value(self, field: &str) -> Result<Value> {
+        match self {
+            Self::Decimal(value) => {
+                serde_json::to_value(required_positive_decimal(value, field)?).map_err(Into::into)
+            }
+            Self::Whole(value) => {
+                if value == 0 {
+                    bail!(
+                        "Trade input invalid: field '{}' must be a positive whole number",
+                        field
+                    );
+                }
+                serde_json::to_value(value).map_err(Into::into)
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct TradeTradabilityGate {
     pub status: String,
@@ -1492,7 +1524,7 @@ pub struct SingleExAnteFields<'a> {
     pub isin: &'a str,
     pub side: TradeSide,
     pub estimated_order_volume: f64,
-    pub number_of_shares: f64,
+    pub number_of_shares: NumberOfShares,
     pub venue: &'a str,
     pub is_whole_position_sold: bool,
 }
@@ -1506,7 +1538,7 @@ pub fn trade_single_ex_ante_variables(fields: SingleExAnteFields<'_>) -> Result<
         "estimatedOrderVolume": round_estimated_order_volume_for_ex_ante(
             required_positive_decimal(fields.estimated_order_volume, "estimated_order_volume")?
         ),
-        "numberOfShares": required_positive_decimal(fields.number_of_shares, "number_of_shares")?,
+        "numberOfShares": fields.number_of_shares.to_json_value("number_of_shares")?,
         "venue": required_non_empty(fields.venue, "venue")?,
         "isWholePositionSold": fields.is_whole_position_sold,
     }))
@@ -1533,7 +1565,7 @@ pub struct PlaceOrderFields<'a> {
     pub side: TradeSide,
     pub portfolio_id: &'a str,
     pub isin: &'a str,
-    pub number_of_shares: f64,
+    pub number_of_shares: NumberOfShares,
     pub currency: &'a str,
     pub venue: &'a str,
     pub limit_price: Option<f64>,
@@ -1548,7 +1580,7 @@ pub fn trade_place_order_variables(fields: PlaceOrderFields<'_>) -> Result<Value
     let mut input = json!({
         "isin": required_non_empty(fields.isin, "isin")?,
         "side": fields.side.as_graphql(),
-        "numberOfShares": required_positive_decimal(fields.number_of_shares, "number_of_shares")?,
+        "numberOfShares": fields.number_of_shares.to_json_value("number_of_shares")?,
         "currency": required_non_empty(fields.currency, "currency")?,
         "venue": required_non_empty(fields.venue, "venue")?,
     });
@@ -1897,7 +1929,7 @@ mod tests {
             side: TradeSide::Buy,
             portfolio_id: "portfolio-1",
             isin: "US0378331005",
-            number_of_shares: 9.0,
+            number_of_shares: NumberOfShares::Whole(9),
             currency: "EUR",
             venue: "MUNC",
             limit_price: Some(123.45),
@@ -1934,7 +1966,7 @@ mod tests {
             side: TradeSide::Buy,
             portfolio_id: "portfolio-1",
             isin: "US0378331005",
-            number_of_shares: 2.0,
+            number_of_shares: NumberOfShares::Whole(2),
             currency: "EUR",
             venue: "MUNC",
             limit_price: None,
@@ -1959,7 +1991,7 @@ mod tests {
             side: TradeSide::Sell,
             portfolio_id: "portfolio-1",
             isin: "US0378331005",
-            number_of_shares: 2.0,
+            number_of_shares: NumberOfShares::Decimal(2.0),
             currency: "EUR",
             venue: "MUNC",
             limit_price: None,
@@ -1974,6 +2006,30 @@ mod tests {
         assert_eq!(vars["isBuy"], false);
         assert_eq!(vars["input"]["side"], "SELL");
         assert_eq!(vars["input"]["numberOfShares"], 2.0);
+    }
+
+    #[test]
+    fn trade_place_order_variables_keep_whole_share_buys_as_integer_json() {
+        let vars = trade_place_order_variables(PlaceOrderFields {
+            side: TradeSide::Buy,
+            portfolio_id: "portfolio-1",
+            isin: "US0378331005",
+            number_of_shares: NumberOfShares::Whole(9_007_199_254_740_993),
+            currency: "EUR",
+            venue: "MUNC",
+            limit_price: None,
+            stop_price: None,
+            appropriateness_id: None,
+            acknowledged_warning_version: None,
+            fill_forecast_id: None,
+            displayed_fill_probability: None,
+        })
+        .expect("place order vars");
+
+        assert_eq!(
+            vars["input"]["numberOfShares"].as_u64(),
+            Some(9_007_199_254_740_993)
+        );
     }
 
     #[test]
@@ -2148,7 +2204,7 @@ mod tests {
             isin: "US0378331005",
             side: TradeSide::Sell,
             estimated_order_volume: 123.45678,
-            number_of_shares: 2.5,
+            number_of_shares: NumberOfShares::Decimal(2.5),
             venue: "MUNC",
             is_whole_position_sold: true,
         })
@@ -2161,6 +2217,23 @@ mod tests {
         assert_eq!(vars["numberOfShares"], 2.5);
         assert_eq!(vars["estimatedOrderVolume"], 123.4568);
         assert_eq!(vars["isWholePositionSold"], true);
+    }
+
+    #[test]
+    fn trade_single_ex_ante_variables_keep_whole_share_buys_as_integer_json() {
+        let vars = trade_single_ex_ante_variables(SingleExAnteFields {
+            person_id: "person-1",
+            portfolio_id: "portfolio-1",
+            isin: "US0378331005",
+            side: TradeSide::Buy,
+            estimated_order_volume: 123.45678,
+            number_of_shares: NumberOfShares::Whole(9_007_199_254_740_993),
+            venue: "MUNC",
+            is_whole_position_sold: false,
+        })
+        .expect("ex-ante vars");
+
+        assert_eq!(vars["numberOfShares"].as_u64(), Some(9_007_199_254_740_993));
     }
 
     #[test]

@@ -2,7 +2,7 @@ use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 
-use crate::overnight_queries::OvernightSummaryInput;
+use crate::overnight_queries::{OvernightSummaryInput, OvernightTransactionsInput};
 use crate::overnight_shared::{DiscoveredOvernightAccount, OvernightOwnerKind};
 
 const OVERNIGHT_FALLBACK_NAME: &str = "Overnight";
@@ -153,6 +153,53 @@ pub(crate) fn project_overnight_summary_response(
     }))
 }
 
+pub(crate) fn project_overnight_transactions_response(
+    input: &OvernightTransactionsInput,
+    response: &Value,
+) -> Result<Value> {
+    let savings_account = required_value(
+        response
+            .get("account")
+            .and_then(|value| value.get("savingsAccount")),
+        "account.savingsAccount",
+    )?;
+    let savings_account_id =
+        required_non_empty_string(savings_account.get("id"), "account.savingsAccount.id")?;
+    if savings_account_id != input.savings_account_id() {
+        return Err(anyhow!(
+            "Overnight response invalid: account.savingsAccount.id did not match the requested savings account id"
+        ));
+    }
+
+    let summaries = required_value(
+        savings_account.get("moreTransactions"),
+        "account.savingsAccount.moreTransactions",
+    )?;
+    let transactions = summaries
+        .get("transactions")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            anyhow!(
+                "Overnight response invalid: missing account.savingsAccount.moreTransactions.transactions"
+            )
+        })?;
+    let total = required_non_null_value(
+        summaries.get("total"),
+        "account.savingsAccount.moreTransactions.total",
+    )?;
+    let items = transactions
+        .iter()
+        .map(map_overnight_transaction)
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(json!({
+        "cursor": summaries.get("cursor").cloned().unwrap_or(Value::Null),
+        "total": total,
+        "count": transactions.len(),
+        "items": items,
+    }))
+}
+
 fn build_minor_display_name(minor: &Value) -> String {
     optional_non_empty_string(minor.get("name"))
         .or_else(|| {
@@ -189,6 +236,14 @@ fn required_value<'a>(value: Option<&'a Value>, path: &str) -> Result<&'a Value>
     value.ok_or_else(|| anyhow!("Overnight response invalid: missing {path}"))
 }
 
+fn required_non_null_value<'a>(value: Option<&'a Value>, path: &str) -> Result<&'a Value> {
+    required_value(value, path).and_then(|value| {
+        (!value.is_null())
+            .then_some(value)
+            .ok_or_else(|| anyhow!("Overnight response invalid: missing {path}"))
+    })
+}
+
 fn required_non_empty_string(value: Option<&Value>, path: &str) -> Result<String> {
     let value = value
         .and_then(Value::as_str)
@@ -204,6 +259,46 @@ fn optional_non_empty_string(value: Option<&Value>) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
+}
+
+fn map_overnight_transaction(transaction: &Value) -> Result<Value> {
+    let documents = match transaction.get("documents") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(documents)) => documents.iter().map(map_transaction_document).collect(),
+        Some(_) => {
+            return Err(anyhow!(
+                "Overnight response invalid: invalid transaction.documents (expected array)"
+            ));
+        }
+    };
+
+    Ok(json!({
+        "id": transaction.get("id").cloned().unwrap_or(Value::Null),
+        "currency": transaction.get("currency").cloned().unwrap_or(Value::Null),
+        "type": transaction.get("type").cloned().unwrap_or(Value::Null),
+        "status": transaction.get("status").cloned().unwrap_or(Value::Null),
+        "is_cancellation": transaction.get("isCancellation").cloned().unwrap_or(Value::Null),
+        "last_event_datetime": timestamp_value_or_null(transaction.get("lastEventDateTime")),
+        "description": transaction.get("description").cloned().unwrap_or(Value::Null),
+        "cash_transaction_type": transaction.get("cashTransactionType").cloned().unwrap_or(Value::Null),
+        "amount": transaction.get("amount").cloned().unwrap_or(Value::Null),
+        "custodian": transaction.get("custodian").cloned().unwrap_or(Value::Null),
+        "related_isin": transaction.get("relatedIsin").cloned().unwrap_or(Value::Null),
+        "documents": documents,
+    }))
+}
+
+fn map_transaction_document(document: &Value) -> Value {
+    json!({
+        "id": document.get("id").cloned().unwrap_or(Value::Null),
+        "label": document.get("label").cloned().unwrap_or(Value::Null),
+        "url": document.get("url").cloned().unwrap_or(Value::Null),
+    })
+}
+
+fn timestamp_value_or_null(raw: Option<&Value>) -> Value {
+    raw.map(|value| value.get("time").cloned().unwrap_or_else(|| value.clone()))
+        .unwrap_or(Value::Null)
 }
 
 fn epoch_seconds_value_or_null(value: &Value, path: &str) -> Result<Value> {

@@ -1,8 +1,9 @@
 use anyhow::Result;
 use serde_json::Value;
 
+use crate::cli::OvernightCommand;
 use crate::config::AppConfig;
-use crate::overnight_query_execution::execute_overnight_summary;
+use crate::overnight_query_execution::{execute_overnight_summary, execute_overnight_transactions};
 use crate::session::SessionManager;
 
 pub(crate) enum HumanOvernightOutput {
@@ -15,14 +16,36 @@ pub(crate) fn run_overnight_command_human(
     config: &AppConfig,
     session_manager: &mut SessionManager,
 ) -> Result<HumanOvernightOutput> {
-    let compact = args.json;
-    let payload = execute_overnight_summary(args, config, session_manager)?;
-    if compact {
-        return Ok(HumanOvernightOutput::Json(payload, true));
+    let crate::cli::OvernightArgs {
+        command,
+        savings_account_id,
+        json,
+    } = args;
+    match command {
+        Some(OvernightCommand::Transactions(transactions_args)) => {
+            let compact = transactions_args.json;
+            let payload =
+                execute_overnight_transactions(transactions_args, config, session_manager)?;
+            Ok(HumanOvernightOutput::Json(payload, compact))
+        }
+        None => {
+            let payload = execute_overnight_summary(
+                crate::cli::OvernightArgs {
+                    command: None,
+                    savings_account_id,
+                    json,
+                },
+                config,
+                session_manager,
+            )?;
+            if json {
+                return Ok(HumanOvernightOutput::Json(payload, true));
+            }
+            Ok(HumanOvernightOutput::Text(render_overnight_summary_text(
+                &payload,
+            )))
+        }
     }
-    Ok(HumanOvernightOutput::Text(render_overnight_summary_text(
-        &payload,
-    )))
 }
 
 pub(crate) fn run_overnight_command_machine(
@@ -30,7 +53,25 @@ pub(crate) fn run_overnight_command_machine(
     config: &AppConfig,
     session_manager: &mut SessionManager,
 ) -> Result<Value> {
-    execute_overnight_summary(args, config, session_manager)
+    let crate::cli::OvernightArgs {
+        command,
+        savings_account_id,
+        json,
+    } = args;
+    match command {
+        Some(OvernightCommand::Transactions(transactions_args)) => {
+            execute_overnight_transactions(transactions_args, config, session_manager)
+        }
+        None => execute_overnight_summary(
+            crate::cli::OvernightArgs {
+                command: None,
+                savings_account_id,
+                json,
+            },
+            config,
+            session_manager,
+        ),
+    }
 }
 
 fn render_overnight_summary_text(payload: &Value) -> Vec<String> {

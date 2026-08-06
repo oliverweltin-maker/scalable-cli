@@ -1,4 +1,5 @@
 use super::*;
+use crate::overnight_queries::OvernightTransactionsOptions;
 use serde_json::{Value, json};
 
 #[test]
@@ -318,4 +319,119 @@ fn project_overnight_summary_rejects_missing_interests() {
 
     let err = project_overnight_summary_response(&input, &response).expect_err("project");
     assert!(err.to_string().contains("account.savingsAccount.interests"));
+}
+
+#[test]
+fn project_overnight_transactions_maps_cash_transaction_page_in_backend_order() {
+    let input = overnight_transactions_input();
+    let response = json!({
+        "account": {
+            "savingsAccount": {
+                "id": "sav-1",
+                "moreTransactions": {
+                    "cursor": "next-page",
+                    "total": 2,
+                    "transactions": [
+                        {
+                            "id": "tx-2",
+                            "currency": "EUR",
+                            "type": "CASH_TRANSACTION",
+                            "status": "CONFIRMED",
+                            "isCancellation": false,
+                            "lastEventDateTime": "2026-03-02T12:00:00Z",
+                            "description": "Interest",
+                            "cashTransactionType": "INTEREST",
+                            "amount": "1.23",
+                            "custodian": "BAADER_BANK",
+                            "relatedIsin": null,
+                            "documents": [{"id": "doc-1", "label": "Receipt", "url": "https://example.test/doc-1"}]
+                        },
+                        {
+                            "id": "tx-1",
+                            "currency": "EUR",
+                            "type": "CASH_TRANSACTION",
+                            "status": "SETTLED",
+                            "isCancellation": false,
+                            "lastEventDateTime": null,
+                            "description": "Deposit",
+                            "cashTransactionType": "DEPOSIT",
+                            "amount": "100.00",
+                            "custodian": null,
+                            "relatedIsin": null,
+                            "documents": []
+                        }
+                    ]
+                }
+            }
+        }
+    });
+
+    let projected = project_overnight_transactions_response(&input, &response).expect("project");
+
+    assert_eq!(projected["cursor"], "next-page");
+    assert_eq!(projected["total"], 2);
+    assert_eq!(projected["count"], 2);
+    assert_eq!(projected["items"][0]["id"], "tx-2");
+    assert_eq!(projected["items"][1]["id"], "tx-1");
+    assert_eq!(projected["items"][0]["cash_transaction_type"], "INTEREST");
+    assert_eq!(projected["items"][0]["documents"][0]["id"], "doc-1");
+}
+
+#[test]
+fn project_overnight_transactions_rejects_mismatched_account_id() {
+    let input = overnight_transactions_input();
+    let response = json!({
+        "account": {
+            "savingsAccount": {
+                "id": "sav-2",
+                "moreTransactions": {"cursor": null, "total": 0, "transactions": []}
+            }
+        }
+    });
+
+    let err = project_overnight_transactions_response(&input, &response)
+        .expect_err("account mismatch should fail");
+    assert!(err.to_string().contains("did not match"));
+}
+
+#[test]
+fn project_overnight_transactions_accepts_empty_page() {
+    let input = overnight_transactions_input();
+    let response = json!({
+        "account": {
+            "savingsAccount": {
+                "id": "sav-1",
+                "moreTransactions": {"cursor": null, "total": 0, "transactions": []}
+            }
+        }
+    });
+
+    let projected = project_overnight_transactions_response(&input, &response).expect("project");
+
+    assert_eq!(projected["cursor"], Value::Null);
+    assert_eq!(projected["total"], 0);
+    assert_eq!(projected["count"], 0);
+    assert_eq!(projected["items"], json!([]));
+}
+
+#[test]
+fn project_overnight_transactions_rejects_malformed_page_shape() {
+    let input = overnight_transactions_input();
+    let malformed_responses = [
+        json!({"account": {"savingsAccount": {"id": "sav-1"}}}),
+        json!({"account": {"savingsAccount": {"id": "sav-1", "moreTransactions": {"total": 1, "transactions": {}}}}}),
+        json!({"account": {"savingsAccount": {"id": "sav-1", "moreTransactions": {"transactions": []}}}}),
+        json!({"account": {"savingsAccount": {"id": "sav-1", "moreTransactions": {"total": null, "transactions": []}}}}),
+        json!({"account": {"savingsAccount": {"id": "sav-1", "moreTransactions": {"total": 1, "transactions": [{"documents": {}}]}}}}),
+    ];
+
+    for response in malformed_responses {
+        assert!(project_overnight_transactions_response(&input, &response).is_err());
+    }
+}
+
+fn overnight_transactions_input() -> OvernightTransactionsInput {
+    let options =
+        OvernightTransactionsOptions::new(20, None, &[], None, None, None).expect("options");
+    OvernightTransactionsInput::new("person-1", "sav-1", options).expect("input")
 }

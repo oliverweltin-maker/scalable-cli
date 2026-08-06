@@ -1,6 +1,8 @@
 use anyhow::{Result, anyhow, bail};
 use serde_json::{Map, Value, json};
 
+#[cfg(test)]
+use crate::trade::NumberOfShares;
 use crate::trade::TradeSide;
 use crate::trade_confirmation::ConfirmationPhase1Input;
 use crate::trade_execution::{
@@ -145,17 +147,11 @@ const PHASE1_PRESENTATION_SECTION_REGULATORY_DISCLOSURES: PresentationSectionSpe
         title: "Regulatory disclosures",
     };
 
-const PHASE1_PRESENTATION_FIELDS_PREFIX: [PresentationFieldSpec; 27] = [
+const PHASE1_PRESENTATION_FIELDS_PREFIX: [PresentationFieldSpec; 26] = [
     PresentationFieldSpec {
         section_key: "trade_intent",
         path: "/result/intent/isin",
         label: "ISIN",
-        nullable: false,
-    },
-    PresentationFieldSpec {
-        section_key: "trade_intent",
-        path: "/result/intent/amount",
-        label: "Amount",
         nullable: false,
     },
     PresentationFieldSpec {
@@ -215,7 +211,7 @@ const PHASE1_PRESENTATION_FIELDS_PREFIX: [PresentationFieldSpec; 27] = [
     PresentationFieldSpec {
         section_key: "calculation",
         path: "/result/calculation/shares",
-        label: "Shares",
+        label: "Effective shares",
         nullable: false,
     },
     PresentationFieldSpec {
@@ -309,6 +305,29 @@ const PHASE1_PRESENTATION_FIELDS_PREFIX: [PresentationFieldSpec; 27] = [
         nullable: true,
     },
 ];
+
+const PHASE1_PRESENTATION_FIELDS_BUY_SIZING: [PresentationFieldSpec; 2] = [
+    PresentationFieldSpec {
+        section_key: "trade_intent",
+        path: "/result/intent/amount",
+        label: "Requested amount",
+        nullable: true,
+    },
+    PresentationFieldSpec {
+        section_key: "trade_intent",
+        path: "/result/intent/shares",
+        label: "Requested shares",
+        nullable: true,
+    },
+];
+
+const PHASE1_PRESENTATION_FIELDS_SELL_SIZING: [PresentationFieldSpec; 1] =
+    [PresentationFieldSpec {
+        section_key: "trade_intent",
+        path: "/result/intent/shares",
+        label: "Requested shares",
+        nullable: false,
+    }];
 
 const EX_ANTE_ID_FIELDS: [ExAnteFieldSpec; 1] = [ExAnteFieldSpec {
     path: "/result/ex_ante_costs/id",
@@ -782,6 +801,14 @@ fn build_price_warnings(prepared: &PreparedTrade) -> Value {
     json!({ "items": items })
 }
 
+fn append_phase1_sizing_argument(cmd: &mut String, phase1_input: &ConfirmationPhase1Input) {
+    if let Some(amount) = phase1_input.amount.as_deref() {
+        cmd.push_str(&format!(" --amount {amount}"));
+    } else if let Some(shares) = phase1_input.shares.as_deref() {
+        cmd.push_str(&format!(" --shares {shares}"));
+    }
+}
+
 pub(crate) fn build_phase2_command_template(
     confirmation_id: &str,
     phase1_input: &ConfirmationPhase1Input,
@@ -792,19 +819,7 @@ pub(crate) fn build_phase2_command_template(
         "sc broker trade {} --isin {} --order-type {}",
         phase1_input.side, phase1_input.isin, phase1_input.order_type
     );
-    match phase1_input.side.as_str() {
-        ORDER_SIDE_BUY => {
-            if let Some(amount) = phase1_input.amount.as_deref() {
-                cmd.push_str(&format!(" --amount {amount}"));
-            }
-        }
-        ORDER_SIDE_SELL => {
-            if let Some(shares) = phase1_input.shares.as_deref() {
-                cmd.push_str(&format!(" --shares {shares}"));
-            }
-        }
-        _ => {}
-    }
+    append_phase1_sizing_argument(&mut cmd, phase1_input);
     if let Some(venue) = phase1_input.venue.as_deref() {
         cmd.push_str(&format!(" --venue {venue}"));
     }
@@ -832,19 +847,7 @@ pub(crate) fn build_phase1_command_template(
         "sc broker trade {} --isin {} --order-type {}",
         phase1_input.side, phase1_input.isin, phase1_input.order_type
     );
-    match phase1_input.side.as_str() {
-        ORDER_SIDE_BUY => {
-            if let Some(amount) = phase1_input.amount.as_deref() {
-                cmd.push_str(&format!(" --amount {amount}"));
-            }
-        }
-        ORDER_SIDE_SELL => {
-            if let Some(shares) = phase1_input.shares.as_deref() {
-                cmd.push_str(&format!(" --shares {shares}"));
-            }
-        }
-        _ => {}
-    }
+    append_phase1_sizing_argument(&mut cmd, phase1_input);
     if let Some(venue) = phase1_input.venue.as_deref() {
         cmd.push_str(&format!(" --venue {venue}"));
     }
@@ -1011,8 +1014,16 @@ fn phase1_fields(side: TradeSide) -> Vec<PresentationFieldSpec> {
     } else {
         0
     };
+    let sizing_field_count = if matches!(side, TradeSide::Buy) {
+        PHASE1_PRESENTATION_FIELDS_BUY_SIZING.len()
+    } else if matches!(side, TradeSide::Sell) {
+        PHASE1_PRESENTATION_FIELDS_SELL_SIZING.len()
+    } else {
+        0
+    };
     let mut fields = Vec::with_capacity(
         PHASE1_PRESENTATION_FIELDS_PREFIX.len()
+            + sizing_field_count
             + PHASE1_PRESENTATION_FIELDS_PRICE_WARNINGS.len()
             + ex_ante_field_count
             + PHASE1_PRESENTATION_FIELDS_SUITABILITY.len()
@@ -1020,7 +1031,13 @@ fn phase1_fields(side: TradeSide) -> Vec<PresentationFieldSpec> {
             + document_link_field_count
             + PHASE1_PRESENTATION_FIELDS_CONFIRMATION.len(),
     );
-    fields.extend_from_slice(&PHASE1_PRESENTATION_FIELDS_PREFIX);
+    fields.push(PHASE1_PRESENTATION_FIELDS_PREFIX[0]);
+    if matches!(side, TradeSide::Buy) {
+        fields.extend_from_slice(&PHASE1_PRESENTATION_FIELDS_BUY_SIZING);
+    } else if matches!(side, TradeSide::Sell) {
+        fields.extend_from_slice(&PHASE1_PRESENTATION_FIELDS_SELL_SIZING);
+    }
+    fields.extend_from_slice(&PHASE1_PRESENTATION_FIELDS_PREFIX[1..]);
     fields.extend_from_slice(&PHASE1_PRESENTATION_FIELDS_PRICE_WARNINGS);
     fields.extend(ex_ante_presentation_fields());
     fields.extend_from_slice(&PHASE1_PRESENTATION_FIELDS_SUITABILITY);
@@ -1054,7 +1071,11 @@ pub(crate) fn presentation_section_order_keys(side: TradeSide) -> Vec<&'static s
 }
 
 pub(crate) fn presentation_required_leaf_paths(side: TradeSide) -> Vec<&'static str> {
-    phase1_fields(side).iter().map(|field| field.path).collect()
+    phase1_fields(side)
+        .iter()
+        .filter(|field| !(field.nullable && is_optional_intent_sizing_field(field.path)))
+        .map(|field| field.path)
+        .collect()
 }
 
 fn presentation_required_leaf_paths_for_root(side: TradeSide, root: &Value) -> Vec<&'static str> {
@@ -1384,12 +1405,19 @@ fn should_omit_optional_nullable_presentation_field(
     root: &Value,
     spec: &PresentationFieldSpec,
 ) -> bool {
-    spec.section_key == "ex_ante_costs" && should_omit_optional_ex_ante_field(root, spec.path)
+    (spec.section_key == "ex_ante_costs" && should_omit_optional_ex_ante_field(root, spec.path))
+        || (spec.nullable
+            && is_optional_intent_sizing_field(spec.path)
+            && root.pointer(spec.path).is_none_or(Value::is_null))
 }
 
 fn should_omit_optional_ex_ante_field(root: &Value, path: &str) -> bool {
     optional_ex_ante_root_for_field(path)
         .is_some_and(|root_path| root.pointer(root_path).is_none_or(Value::is_null))
+}
+
+fn is_optional_intent_sizing_field(path: &str) -> bool {
+    matches!(path, "/result/intent/amount" | "/result/intent/shares")
 }
 
 fn optional_ex_ante_root_for_field(path: &str) -> Option<&'static str> {
@@ -1430,6 +1458,16 @@ pub(crate) fn build_phase1_presentation(result: &Value, confirmation: &Value) ->
         }
 
         let value = match root.pointer(spec.path) {
+            Some(found)
+                if found.is_null()
+                    && !spec.nullable
+                    && is_optional_intent_sizing_field(spec.path) =>
+            {
+                bail!(
+                    "{PRESENTATION_MAPPING_INCOMPLETE}: required path '{}' must not be null",
+                    spec.path
+                )
+            }
             Some(found) => found.clone(),
             None if spec.nullable => Value::Null,
             None => bail!(
@@ -1485,6 +1523,11 @@ fn render_trade_prefix_lines(payload: &Value, buy: bool) -> Vec<String> {
         .and_then(|v| v.get("amount"))
         .and_then(Value::as_str);
     let shares = payload
+        .get("result")
+        .and_then(|v| v.get("intent"))
+        .and_then(|v| v.get("shares"))
+        .and_then(Value::as_str);
+    let effective_shares = payload
         .get("result")
         .and_then(|v| v.get("calculation"))
         .and_then(|v| v.get("shares"))
@@ -1573,9 +1616,12 @@ fn render_trade_prefix_lines(payload: &Value, buy: bool) -> Vec<String> {
             lines.push(format!("amount: {amount}"));
         }
         if let Some(shares) = shares {
+            lines.push(format!("requested_shares: {shares}"));
+        }
+        if let Some(shares) = effective_shares {
             lines.push(format!("shares: {shares}"));
         }
-    } else if let Some(shares) = shares {
+    } else if let Some(shares) = effective_shares {
         lines.push(format!("shares: {shares}"));
     }
     lines.extend([
@@ -1661,10 +1707,28 @@ mod tests {
     use crate::trade_execution::{TradeIntent, VENUE_LABEL_SEIX};
 
     fn sample_phase1_input(side: &str) -> ConfirmationPhase1Input {
+        let (amount, shares) = match side {
+            "buy" => (Some("500".to_string()), None),
+            "sell" => (None, Some("9".to_string())),
+            other => panic!("unsupported sample side {other}"),
+        };
         ConfirmationPhase1Input {
             side: side.to_string(),
             isin: "DE0007100000".to_string(),
-            amount: Some("500".to_string()),
+            amount,
+            shares,
+            venue: Some("SEIX".to_string()),
+            order_type: "limit".to_string(),
+            limit_price: Some("48.50".to_string()),
+            stop_price: Some("47.00".to_string()),
+        }
+    }
+
+    fn sample_phase1_input_buy_shares() -> ConfirmationPhase1Input {
+        ConfirmationPhase1Input {
+            side: "buy".to_string(),
+            isin: "DE0007100000".to_string(),
+            amount: None,
             shares: Some("9".to_string()),
             venue: Some("SEIX".to_string()),
             order_type: "limit".to_string(),
@@ -1686,8 +1750,8 @@ mod tests {
             TradeSide::Buy => (
                 Some(500.0),
                 Some("500".to_string()),
-                Some(9.0),
-                Some("9".to_string()),
+                None,
+                None,
                 Some("500".to_string()),
                 Some(50.5),
                 Some("50.50".to_string()),
@@ -1695,7 +1759,7 @@ mod tests {
             TradeSide::Sell => (
                 None,
                 None,
-                Some(9.0),
+                Some(NumberOfShares::Decimal(9.0)),
                 Some("9".to_string()),
                 None,
                 Some(50.9),
@@ -1764,7 +1828,7 @@ mod tests {
             },
             estimate_price_basis: "limit_price",
             estimate_price,
-            number_of_shares: 9.0,
+            number_of_shares: NumberOfShares::Whole(9),
             number_of_shares_str: "9".to_string(),
             is_whole_position_sold: false,
             estimated_order_volume_raw: 454.1049,
@@ -1856,6 +1920,16 @@ mod tests {
         assert_eq!(
             template,
             "sc broker trade buy --isin DE0007100000 --order-type limit --amount 500 --venue SEIX --limit-price 48.50 --stop-price 47.00 --confirm scb1_test --accept-unsuitable --json"
+        );
+    }
+
+    #[test]
+    fn phase1_command_template_uses_buy_shares_when_present() {
+        let template = build_phase1_command_template(&sample_phase1_input_buy_shares(), true);
+
+        assert_eq!(
+            template,
+            "sc broker trade buy --isin DE0007100000 --order-type limit --shares 9 --venue SEIX --limit-price 48.50 --stop-price 47.00 --json"
         );
     }
 
@@ -2174,6 +2248,221 @@ mod tests {
                 .any(|line| line.starts_with("estimate_price_basis:"))
         );
         assert!(!lines.iter().any(|line| line.starts_with("estimate_price:")));
+    }
+
+    #[test]
+    fn build_phase1_presentation_uses_requested_shares_for_share_sized_buy() {
+        let mut prepared = sample_prepared_trade(TradeSide::Buy);
+        prepared.intent.amount = None;
+        prepared.intent.amount_str = None;
+        prepared.intent.shares = Some(NumberOfShares::Whole(9));
+        prepared.intent.shares_str = Some("9".to_string());
+        prepared.confirmation_fields.amount = None;
+        let payload = build_result_payload(&prepared, None);
+        let presentation = build_phase1_presentation(
+            &payload,
+            &json!({
+                "id": "scb1_test",
+                "expires_at_epoch": 1_777_777_777i64
+            }),
+        )
+        .expect("presentation should build");
+
+        assert!(find_field(&presentation, "/result/intent/amount").is_none());
+        assert_eq!(
+            find_field(&presentation, "/result/intent/shares")
+                .and_then(|field| field.get("label"))
+                .and_then(Value::as_str),
+            Some("Requested shares")
+        );
+        assert_eq!(
+            find_field(&presentation, "/result/calculation/shares")
+                .and_then(|field| field.get("label"))
+                .and_then(Value::as_str),
+            Some("Effective shares")
+        );
+
+        let required_leaf_paths = presentation
+            .get("required_leaf_paths")
+            .and_then(Value::as_array)
+            .expect("required leaf paths");
+        assert!(
+            required_leaf_paths
+                .iter()
+                .any(|item| item.as_str() == Some("/result/intent/shares"))
+        );
+        assert!(
+            !required_leaf_paths
+                .iter()
+                .any(|item| item.as_str() == Some("/result/intent/amount"))
+        );
+    }
+
+    #[test]
+    fn build_phase1_presentation_omits_requested_shares_for_amount_sized_buy() {
+        let payload = build_result_payload(&sample_prepared_trade(TradeSide::Buy), None);
+        let presentation = build_phase1_presentation(
+            &payload,
+            &json!({
+                "id": "scb1_test",
+                "expires_at_epoch": 1_777_777_777i64
+            }),
+        )
+        .expect("presentation should build");
+
+        assert_eq!(
+            find_field(&presentation, "/result/intent/amount")
+                .and_then(|field| field.get("label"))
+                .and_then(Value::as_str),
+            Some("Requested amount")
+        );
+        assert!(find_field(&presentation, "/result/intent/shares").is_none());
+
+        let required_leaf_paths = presentation
+            .get("required_leaf_paths")
+            .and_then(Value::as_array)
+            .expect("required leaf paths");
+        assert!(
+            required_leaf_paths
+                .iter()
+                .any(|item| item.as_str() == Some("/result/intent/amount"))
+        );
+        assert!(
+            !required_leaf_paths
+                .iter()
+                .any(|item| item.as_str() == Some("/result/intent/shares"))
+        );
+    }
+
+    #[test]
+    fn build_phase1_presentation_rejects_missing_sell_requested_shares() {
+        let mut payload = build_result_payload(&sample_prepared_trade(TradeSide::Sell), None);
+        payload
+            .get_mut("intent")
+            .and_then(Value::as_object_mut)
+            .expect("intent object")
+            .remove("shares");
+
+        let err = build_phase1_presentation(
+            &payload,
+            &json!({
+                "id": "scb1_test",
+                "expires_at_epoch": 1_777_777_777i64
+            }),
+        )
+        .expect_err("missing sell shares should fail closed");
+
+        assert_eq!(
+            err.to_string(),
+            "PRESENTATION_MAPPING_INCOMPLETE: missing required path '/result/intent/shares'"
+        );
+    }
+
+    #[test]
+    fn build_phase1_presentation_rejects_null_sell_requested_shares() {
+        let mut payload = build_result_payload(&sample_prepared_trade(TradeSide::Sell), None);
+        payload["intent"]["shares"] = Value::Null;
+
+        let err = build_phase1_presentation(
+            &payload,
+            &json!({
+                "id": "scb1_test",
+                "expires_at_epoch": 1_777_777_777i64
+            }),
+        )
+        .expect_err("null sell shares should fail closed");
+
+        assert_eq!(
+            err.to_string(),
+            "PRESENTATION_MAPPING_INCOMPLETE: required path '/result/intent/shares' must not be null"
+        );
+    }
+
+    #[test]
+    fn static_required_leaf_paths_omit_buy_mode_specific_sizing_paths() {
+        let required_leaf_paths = presentation_required_leaf_paths(TradeSide::Buy);
+
+        assert!(!required_leaf_paths.contains(&"/result/intent/amount"));
+        assert!(!required_leaf_paths.contains(&"/result/intent/shares"));
+    }
+
+    #[test]
+    fn static_required_leaf_paths_keep_sell_requested_shares() {
+        let required_leaf_paths = presentation_required_leaf_paths(TradeSide::Sell);
+
+        assert!(required_leaf_paths.contains(&"/result/intent/shares"));
+    }
+
+    #[test]
+    fn render_trade_buy_text_shows_requested_shares_for_share_sized_buy() {
+        let payload = json!({
+            "result": {
+                "intent": {
+                    "side": "buy",
+                    "isin": "DE0007100000",
+                    "amount": Value::Null,
+                    "shares": "9",
+                    "order_type": "market",
+                    "limit_price": Value::Null,
+                    "stop_price": Value::Null,
+                    "venue_override": Value::Null,
+                    "locale": "en_DE"
+                },
+                "market_quote": {
+                    "mid_price": "50.4561",
+                    "ask_price": "50.5000",
+                    "bid_price": "50.4000",
+                    "currency": "EUR",
+                    "is_outdated": false,
+                    "timestamp_utc": "2026-03-10T19:25:29.000Z"
+                },
+                "calculation": {
+                    "shares": "9",
+                    "sizing_price_basis": "ask_price",
+                    "sizing_price": "50.5000",
+                    "estimate_price_basis": "ask_price",
+                    "estimate_price": "50.5000",
+                    "estimated_order_volume_raw": "454.5000",
+                    "estimated_order_volume": "454.5000",
+                    "is_whole_position_sold": false
+                },
+                "tradability": {
+                    "selected_venue_label": "European Investor Exchange (EIX)"
+                },
+                "order_submission": {
+                    "submitted": false,
+                    "reason": "phase_1_preview_only"
+                },
+                "price_warnings": { "items": [] },
+                "ex_ante_costs": {
+                    "id": "cost-id",
+                    "entryCosts": Value::Null,
+                    "ongoingCosts": {"serviceCosts": {"amount": 0, "percentage": 0}, "productCosts": {"amount": 0, "percentage": 0}, "total": {"amount": 0, "percentage": 0}},
+                    "exitCosts": {"serviceCosts": {"amount": 0, "percentage": 0}, "productCosts": {"amount": 0, "percentage": 0}, "total": {"amount": 0, "percentage": 0}},
+                    "effectOnReturn": {"initialYearCosts": Value::Null, "followingYearsCosts": Value::Null, "finalYearCosts": {"amount": 0, "percentage": 0}},
+                    "fiveYearsCosts": {"amount": 0, "percentage": 0},
+                    "incidentalCosts": {"amount": 0, "percentage": 0}
+                },
+                "suitability": {
+                    "source": "not_required",
+                    "type": Value::Null,
+                    "status": "NOT_REQUIRED",
+                    "action_when_unsuitable": Value::Null,
+                    "questionnaire_required": false,
+                    "questionnaire_reason": Value::Null,
+                    "requires_accept_unsuitable": false,
+                    "accept_flag": Value::Null
+                }
+            },
+            "confirmation": { "id": "scb1_test" },
+            "next_step": "confirm_with_id"
+        });
+
+        let lines = render_trade_buy_text(&payload);
+
+        assert!(lines.iter().any(|line| line == "requested_shares: 9"));
+        assert!(lines.iter().any(|line| line == "shares: 9"));
+        assert!(!lines.iter().any(|line| line.starts_with("amount: ")));
     }
 
     #[test]

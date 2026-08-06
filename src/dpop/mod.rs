@@ -19,6 +19,38 @@ mod software;
 pub(crate) const DPOP_SESSION_KEY_RELOGIN_MESSAGE: &str =
     "The DPoP signing key for the current session is missing or changed; run 'sc login' again.";
 
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+const ERR_SEC_INTERACTION_NOT_ALLOWED: i64 = -25308;
+
+#[derive(Debug)]
+pub(crate) struct SecureEnclaveKeyLocked;
+
+impl std::fmt::Display for SecureEnclaveKeyLocked {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "The Mac is locked, so the Secure Enclave signing key cannot be used. Unlock the Mac and retry."
+        )
+    }
+}
+
+impl std::error::Error for SecureEnclaveKeyLocked {}
+
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+pub(crate) fn map_secure_enclave_signing_error(
+    status: i64,
+    diagnostic: impl std::fmt::Display,
+) -> anyhow::Error {
+    let signing_error = anyhow!(diagnostic.to_string())
+        .context("Failed signing DPoP proof with Secure Enclave key");
+
+    if status == ERR_SEC_INTERACTION_NOT_ALLOWED {
+        signing_error.context(SecureEnclaveKeyLocked)
+    } else {
+        signing_error
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DpopRuntimeOptions {
     pub key_backend: DpopKeyBackend,
@@ -281,7 +313,29 @@ fn current_epoch_seconds() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use p256::elliptic_curve::rand_core::OsRng;
+    use p256::elliptic_curve::Generate;
+
+    #[test]
+    fn secure_enclave_interaction_not_allowed_marks_source_as_locked() {
+        let err = map_secure_enclave_signing_error(-25308, "native Secure Enclave signing failure");
+
+        assert!(err.downcast_ref::<SecureEnclaveKeyLocked>().is_some());
+        assert!(
+            err.chain()
+                .any(|cause| cause.to_string() == "native Secure Enclave signing failure")
+        );
+    }
+
+    #[test]
+    fn other_secure_enclave_status_does_not_mark_source_as_locked() {
+        let err = map_secure_enclave_signing_error(-25309, "native Secure Enclave signing failure");
+
+        assert!(err.downcast_ref::<SecureEnclaveKeyLocked>().is_none());
+        assert_eq!(
+            err.to_string(),
+            "Failed signing DPoP proof with Secure Enclave key"
+        );
+    }
 
     #[test]
     fn canonicalize_htu_strips_query_and_fragment() {
@@ -336,7 +390,7 @@ mod tests {
 
     #[test]
     fn der_signature_conversion_produces_raw_64_bytes() {
-        let key = SigningKey::random(&mut OsRng);
+        let key = SigningKey::generate();
         let sig: Signature = key.sign(b"hello");
         let der = sig.to_der();
 

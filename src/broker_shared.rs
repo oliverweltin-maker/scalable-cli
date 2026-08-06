@@ -1,12 +1,12 @@
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 
 use crate::broker_context::load_context as load_broker_context;
 use crate::config::{EnvConfig, TargetEnv};
 use crate::dpop::DpopRuntimeOptions;
 use crate::graphql::{GraphqlAccessContext, execute_graphql};
 use crate::helpers::BrokerInput;
+use crate::payload_fingerprint::input_fingerprint_payload;
 use crate::session::{Session, SessionManager};
 use crate::session_refresh::execute_with_refresh_retry;
 
@@ -21,6 +21,19 @@ query ResolveBrokerIds($id: ID!) {
 }
 "#;
 
+pub(crate) const BROKER_PORTFOLIO_GROUP_NOT_FOUND_ERROR_PREFIX: &str =
+    "Broker portfolio group not found:";
+pub(crate) const BROKER_PORTFOLIO_GROUP_INVALID_CHARACTERS_ERROR_PREFIX: &str =
+    "Broker portfolio group invalid characters:";
+pub(crate) const BROKER_PORTFOLIO_GROUPS_QUOTA_EXCEEDED_ERROR_PREFIX: &str =
+    "Broker portfolio groups quota exceeded:";
+pub(crate) const BROKER_PORTFOLIO_GROUPS_LIMIT_REACHED_ERROR_PREFIX: &str =
+    "Broker portfolio groups limit reached:";
+pub(crate) const BROKER_PORTFOLIO_GROUP_ALREADY_EXISTS_ERROR_PREFIX: &str =
+    "Broker portfolio group already exists:";
+pub(crate) const BROKER_PORTFOLIO_GROUP_CANNOT_BE_REMOVED_ERROR_PREFIX: &str =
+    "Broker portfolio group cannot be removed:";
+
 pub(crate) struct ResolvedBrokerIds {
     pub(crate) account_id: String,
     pub(crate) portfolio_id: String,
@@ -29,41 +42,7 @@ pub(crate) struct ResolvedBrokerIds {
 }
 
 pub(crate) fn fingerprint_payload_for_transactions_input(normalized_input: &Value) -> Value {
-    let mut payload = normalized_input.clone();
-    if let Some(obj) = payload.as_object_mut() {
-        obj.remove("cursor");
-    }
-    payload
-}
-
-pub(crate) fn checksum_for_payload(payload: &Value) -> String {
-    let canonical = canonicalize_json(payload);
-    sha256_hex(canonical.to_string().as_bytes())
-}
-
-fn canonicalize_json(value: &Value) -> Value {
-    match value {
-        Value::Object(map) => {
-            let mut keys = map.keys().cloned().collect::<Vec<_>>();
-            keys.sort();
-            let mut sorted = serde_json::Map::with_capacity(map.len());
-            for key in keys {
-                if let Some(child) = map.get(&key) {
-                    sorted.insert(key, canonicalize_json(child));
-                }
-            }
-            Value::Object(sorted)
-        }
-        Value::Array(items) => Value::Array(items.iter().map(canonicalize_json).collect()),
-        _ => value.clone(),
-    }
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    let digest = hasher.finalize();
-    digest.iter().map(|b| format!("{b:02x}")).collect()
+    input_fingerprint_payload(normalized_input)
 }
 
 pub(crate) fn validated_broker_input(
@@ -77,6 +56,18 @@ pub(crate) fn validated_broker_input(
         include_year_to_date,
         quote_source,
     )
+}
+
+pub(crate) fn broker_result_envelope(ids: &ResolvedBrokerIds, result: Value) -> Value {
+    json!({
+        "account_id": ids.account_id,
+        "portfolio_id": ids.portfolio_id,
+        "resolution": {
+            "account": ids.account_source,
+            "portfolio": ids.portfolio_source,
+        },
+        "result": result,
+    })
 }
 
 pub(crate) fn resolve_broker_ids(

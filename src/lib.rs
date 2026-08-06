@@ -4,6 +4,10 @@ mod active_session;
 mod auth;
 mod broker_commands;
 mod broker_context;
+mod broker_portfolio_groups;
+mod broker_portfolio_groups_projections;
+mod broker_portfolio_groups_queries;
+mod broker_portfolio_groups_render;
 mod broker_projections;
 mod broker_queries;
 mod broker_query_execution;
@@ -13,6 +17,7 @@ mod cli;
 mod command_handlers;
 mod config;
 pub mod dpop;
+mod execution_context;
 mod graphql;
 mod helpers;
 mod installation_code;
@@ -22,6 +27,9 @@ mod overnight_projections;
 mod overnight_queries;
 mod overnight_query_execution;
 mod overnight_shared;
+mod payload_fingerprint;
+mod savings_plan_confirmation;
+mod savings_plan_presentation;
 pub mod session;
 mod session_refresh;
 pub mod token;
@@ -36,7 +44,7 @@ pub mod transport_security;
 pub use crate::machine::{human_error_message, user_error_message};
 
 use anyhow::{Context, Result, bail};
-use clap::Parser;
+use clap::{Parser, error::ErrorKind};
 use serde_json::{Value, json};
 
 use crate::auth::{login_with_device_code, revoke_tokens_on_logout_best_effort};
@@ -46,17 +54,25 @@ use crate::broker_commands::{
 };
 use crate::broker_context::delete_context as delete_broker_context;
 use crate::cli::{
-    BrokerCommand, BrokerContextCommand, BrokerDerivativesCommand, BrokerPriceAlertsCommand,
-    BrokerSavingsPlansCommand, BrokerTradeCommand, BrokerTransactionCommand,
-    BrokerWatchlistCommand, Cli, Commands, InstallationCodeArgs,
+    BrokerCommand, BrokerContextCommand, BrokerDerivativesCommand, BrokerPortfolioGroupsCommand,
+    BrokerPriceAlertsCommand, BrokerSavingsPlansCommand, BrokerTradeCommand,
+    BrokerTransactionCommand, BrokerWatchlistCommand, Cli, Commands, InstallationCodeArgs,
+    OvernightCommand,
 };
 use crate::command_handlers::{run_human_whoami_command, run_machine_whoami_command};
 use crate::config::{AppConfig, EnvConfig, TargetEnv};
 use crate::dpop::DpopRuntimeOptions;
+use crate::execution_context::{ExecutionContext, ParseFailureContext};
 use crate::installation_code::load_or_create_installation_code;
-use crate::machine::{print_error, print_success};
+use crate::machine::{print_clap_error, print_error, print_success};
 use crate::overnight_commands::{
     HumanOvernightOutput, run_overnight_command_human, run_overnight_command_machine,
+};
+use crate::savings_plan_confirmation::clear_on_logout as clear_savings_plan_confirmation_on_logout;
+use crate::savings_plan_presentation::{
+    COMPLIANCE_RULE_ID as SAVINGS_PLAN_COMPLIANCE_RULE_ID,
+    PRESENTATION_FORMAT as SAVINGS_PLAN_PRESENTATION_FORMAT,
+    required_leaf_paths as savings_plan_required_leaf_paths,
 };
 use crate::session::{SessionManager, SessionMode};
 use crate::trade::TradeSide;
@@ -70,34 +86,48 @@ use crate::trade_presentation::{
 use crate::transport_security::validate_env_transport_security;
 
 pub fn run() -> Result<()> {
-    let Cli { command } = Cli::parse();
-    let raw_machine_output = raw_command_requests_json_envelope(&command);
-    let raw_command_name = machine_command_name(&command);
+    let raw_args: Vec<_> = std::env::args_os().collect();
+    let Cli { command } = match Cli::try_parse_from(raw_args.clone()) {
+        Ok(cli) => cli,
+        Err(err) => {
+            let context = ParseFailureContext::from_raw_args_and_error(&raw_args, &err);
+            match err.kind() {
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => err.exit(),
+                _ if context.requests_machine_output() => {
+                    let exit_code = print_clap_error(&context.command_name, &err);
+                    std::process::exit(exit_code);
+                }
+                _ => err.exit(),
+            }
+        }
+    };
+    let pre_normalization_context =
+        ExecutionContext::from_raw_args_and_command(&raw_args, &command);
     let command = match normalize_command(command) {
         Ok(command) => command,
-        Err(err) if raw_machine_output => {
-            let exit_code = print_error(raw_command_name, &err);
+        Err(err) if pre_normalization_context.requests_machine_output() => {
+            let exit_code = print_error(pre_normalization_context.command_name, &err);
             std::process::exit(exit_code);
         }
         Err(err) => return Err(err),
     };
+    let execution_context = ExecutionContext::from_command(&command);
 
     if let Commands::InstallationCode(args) = command {
-        return run_installation_code_command(args, raw_command_name, raw_machine_output);
+        return run_installation_code_command(args, execution_context);
     }
 
     let config = AppConfig::load_or_default()?;
     let mut session_manager = SessionManager::new(&config)?;
 
-    if command_requests_json_envelope(&command) {
-        let command_name = machine_command_name(&command);
+    if execution_context.requests_machine_output() {
         match run_machine_command(command, &config, &mut session_manager) {
             Ok(data) => {
-                print_success(command_name, data);
+                print_success(execution_context.command_name, data);
                 return Ok(());
             }
             Err(err) => {
-                let exit_code = print_error(command_name, &err);
+                let exit_code = print_error(execution_context.command_name, &err);
                 std::process::exit(exit_code);
             }
         }
@@ -106,56 +136,55 @@ pub fn run() -> Result<()> {
     run_human_command(command, &config, &mut session_manager)
 }
 
-fn command_requests_json_envelope(command: &Commands) -> bool {
+pub(crate) fn command_requests_json_envelope(command: &Commands) -> bool {
     match command {
         Commands::InstallationCode(args) => args.json,
         Commands::Login(_) => false,
         Commands::Logout(args) => args.json,
         Commands::Whoami(args) => args.json,
-        Commands::Overnight(args) => args.json,
+        Commands::Overnight(args) => match &args.command {
+            Some(OvernightCommand::Transactions(transactions_args)) => transactions_args.json,
+            None => args.json,
+        },
         Commands::Broker(args) => broker_command_requests_json(&args.command),
         Commands::Capabilities(args) => args.json,
     }
 }
 
-fn raw_command_requests_json_envelope(command: &Commands) -> bool {
-    match command {
-        Commands::InstallationCode(args) => args.json,
-        Commands::Broker(args) => raw_broker_command_requests_json(&args.command),
-        other => command_requests_json_envelope(other),
-    }
-}
-
-fn raw_broker_command_requests_json(command: &BrokerCommand) -> bool {
-    match command {
-        BrokerCommand::Watchlist(args) => match &args.command {
-            Some(BrokerWatchlistCommand::Add(add_args)) => args.json || add_args.json,
-            Some(BrokerWatchlistCommand::Remove(remove_args)) => args.json || remove_args.json,
-            None => args.json,
-        },
-        BrokerCommand::PriceAlerts(args) => match &args.command {
-            Some(BrokerPriceAlertsCommand::Add(add_args)) => args.json || add_args.json,
-            Some(BrokerPriceAlertsCommand::Remove(remove_args)) => args.json || remove_args.json,
-            None => args.json,
-        },
-        BrokerCommand::Derivatives(args) => match &args.command {
-            BrokerDerivativesCommand::Search(search_args) => search_args.json,
-        },
-        BrokerCommand::SavingsPlans(args) => match &args.command {
-            Some(BrokerSavingsPlansCommand::Add(add_args)) => args.json || add_args.json,
-            Some(BrokerSavingsPlansCommand::Remove(remove_args)) => args.json || remove_args.json,
-            None => args.json,
-        },
-        other => broker_command_requests_json(other),
-    }
-}
-
 fn normalize_command(command: Commands) -> Result<Commands> {
     match command {
+        Commands::Overnight(args) => Ok(Commands::Overnight(normalize_overnight_args(args)?)),
         Commands::Broker(args) => Ok(Commands::Broker(crate::cli::BrokerArgs {
             command: normalize_broker_command(args.command)?,
         })),
         other => Ok(other),
+    }
+}
+
+fn normalize_overnight_args(args: crate::cli::OvernightArgs) -> Result<crate::cli::OvernightArgs> {
+    let crate::cli::OvernightArgs {
+        command,
+        savings_account_id,
+        json,
+    } = args;
+
+    match command {
+        Some(OvernightCommand::Transactions(mut transactions_args)) => {
+            if transactions_args.savings_account_id.is_none() {
+                transactions_args.savings_account_id = savings_account_id;
+            }
+            transactions_args.json |= json;
+            Ok(crate::cli::OvernightArgs {
+                command: Some(OvernightCommand::Transactions(transactions_args)),
+                savings_account_id: None,
+                json: false,
+            })
+        }
+        None => Ok(crate::cli::OvernightArgs {
+            command: None,
+            savings_account_id,
+            json,
+        }),
     }
 }
 
@@ -169,6 +198,9 @@ fn normalize_broker_command(command: BrokerCommand) -> Result<BrokerCommand> {
         )),
         BrokerCommand::SavingsPlans(args) => Ok(BrokerCommand::SavingsPlans(
             normalize_savings_plan_args(args)?,
+        )),
+        BrokerCommand::PortfolioGroups(args) => Ok(BrokerCommand::PortfolioGroups(
+            normalize_portfolio_groups_args(args)?,
         )),
         other => Ok(other),
     }
@@ -326,6 +358,19 @@ fn normalize_savings_plan_args(
                 json: false,
             })
         }
+        Some(BrokerSavingsPlansCommand::Config(mut config_args)) => {
+            inherit_portfolio_id_and_json(
+                &mut config_args.portfolio_id,
+                &mut config_args.json,
+                portfolio_id,
+                json,
+            );
+            Ok(crate::cli::BrokerSavingsPlansArgs {
+                command: Some(BrokerSavingsPlansCommand::Config(config_args)),
+                portfolio_id: None,
+                json: false,
+            })
+        }
         Some(BrokerSavingsPlansCommand::Remove(mut remove_args)) => {
             inherit_portfolio_id_and_json(
                 &mut remove_args.portfolio_id,
@@ -345,6 +390,119 @@ fn normalize_savings_plan_args(
             json,
         }),
     }
+}
+
+fn normalize_portfolio_groups_args(
+    args: crate::cli::BrokerPortfolioGroupsArgs,
+) -> Result<crate::cli::BrokerPortfolioGroupsArgs> {
+    let crate::cli::BrokerPortfolioGroupsArgs {
+        command,
+        portfolio_id,
+        group_id,
+        json,
+    } = args;
+
+    match command {
+        Some(BrokerPortfolioGroupsCommand::Create(mut create_args)) => {
+            reject_portfolio_groups_read_only_group_id(group_id.as_deref())?;
+            inherit_portfolio_id_and_json(
+                &mut create_args.portfolio_id,
+                &mut create_args.json,
+                portfolio_id,
+                json,
+            );
+            Ok(crate::cli::BrokerPortfolioGroupsArgs {
+                command: Some(BrokerPortfolioGroupsCommand::Create(create_args)),
+                portfolio_id: None,
+                group_id: None,
+                json: false,
+            })
+        }
+        Some(BrokerPortfolioGroupsCommand::Update(mut update_args)) => {
+            reject_portfolio_groups_read_only_group_id(group_id.as_deref())?;
+            if update_args.name.is_none()
+                && update_args.description.is_none()
+                && !update_args.clear_description
+            {
+                bail!(
+                    "Broker input invalid: one of `--name`, `--description`, or `--clear-description` is required for `sc broker portfolio-groups update`"
+                );
+            }
+            inherit_portfolio_id_and_json(
+                &mut update_args.portfolio_id,
+                &mut update_args.json,
+                portfolio_id,
+                json,
+            );
+            Ok(crate::cli::BrokerPortfolioGroupsArgs {
+                command: Some(BrokerPortfolioGroupsCommand::Update(update_args)),
+                portfolio_id: None,
+                group_id: None,
+                json: false,
+            })
+        }
+        Some(BrokerPortfolioGroupsCommand::Delete(mut delete_args)) => {
+            reject_portfolio_groups_read_only_group_id(group_id.as_deref())?;
+            inherit_portfolio_id_and_json(
+                &mut delete_args.portfolio_id,
+                &mut delete_args.json,
+                portfolio_id,
+                json,
+            );
+            Ok(crate::cli::BrokerPortfolioGroupsArgs {
+                command: Some(BrokerPortfolioGroupsCommand::Delete(delete_args)),
+                portfolio_id: None,
+                group_id: None,
+                json: false,
+            })
+        }
+        Some(BrokerPortfolioGroupsCommand::Assign(mut assign_args)) => {
+            reject_portfolio_groups_read_only_group_id(group_id.as_deref())?;
+            inherit_portfolio_id_and_json(
+                &mut assign_args.portfolio_id,
+                &mut assign_args.json,
+                portfolio_id,
+                json,
+            );
+            Ok(crate::cli::BrokerPortfolioGroupsArgs {
+                command: Some(BrokerPortfolioGroupsCommand::Assign(assign_args)),
+                portfolio_id: None,
+                group_id: None,
+                json: false,
+            })
+        }
+        Some(BrokerPortfolioGroupsCommand::Unassign(mut unassign_args)) => {
+            reject_portfolio_groups_read_only_group_id(group_id.as_deref())?;
+            inherit_portfolio_id_and_json(
+                &mut unassign_args.portfolio_id,
+                &mut unassign_args.json,
+                portfolio_id,
+                json,
+            );
+            Ok(crate::cli::BrokerPortfolioGroupsArgs {
+                command: Some(BrokerPortfolioGroupsCommand::Unassign(unassign_args)),
+                portfolio_id: None,
+                group_id: None,
+                json: false,
+            })
+        }
+        None => Ok(crate::cli::BrokerPortfolioGroupsArgs {
+            command: None,
+            portfolio_id,
+            group_id,
+            json,
+        }),
+    }
+}
+
+fn reject_portfolio_groups_read_only_group_id(group_id: Option<&str>) -> Result<()> {
+    if group_id.is_some() {
+        bail!(
+            "Broker input invalid: `--group-id` is only supported for `sc broker portfolio-groups` without a subcommand"
+        );
+    }
+
+    Ok(())
 }
 
 fn inherit_portfolio_id_and_json(
@@ -373,6 +531,14 @@ fn broker_command_requests_json(command: &BrokerCommand) -> bool {
             BrokerTransactionCommand::Details(args) => args.json,
         },
         BrokerCommand::Holdings(args) => args.json,
+        BrokerCommand::PortfolioGroups(args) => match &args.command {
+            Some(BrokerPortfolioGroupsCommand::Create(create_args)) => create_args.json,
+            Some(BrokerPortfolioGroupsCommand::Update(update_args)) => update_args.json,
+            Some(BrokerPortfolioGroupsCommand::Delete(delete_args)) => delete_args.json,
+            Some(BrokerPortfolioGroupsCommand::Assign(assign_args)) => assign_args.json,
+            Some(BrokerPortfolioGroupsCommand::Unassign(unassign_args)) => unassign_args.json,
+            None => args.json,
+        },
         BrokerCommand::Watchlist(args) => match &args.command {
             Some(BrokerWatchlistCommand::Add(add_args)) => add_args.json,
             Some(BrokerWatchlistCommand::Remove(remove_args)) => remove_args.json,
@@ -392,6 +558,7 @@ fn broker_command_requests_json(command: &BrokerCommand) -> bool {
         },
         BrokerCommand::SavingsPlans(args) => match &args.command {
             Some(BrokerSavingsPlansCommand::Add(add_args)) => add_args.json,
+            Some(BrokerSavingsPlansCommand::Config(config_args)) => config_args.json,
             Some(BrokerSavingsPlansCommand::Remove(remove_args)) => remove_args.json,
             None => args.json,
         },
@@ -544,6 +711,7 @@ fn cleanup_local_artifacts_on_logout_best_effort() {
     cleanup_broker_context_best_effort();
     let _ = delete_attempt_store();
     let _ = delete_confirmation_store();
+    let _ = clear_savings_plan_confirmation_on_logout();
 }
 
 fn finalize_login_human(
@@ -589,6 +757,7 @@ fn machine_capabilities(config: &AppConfig) -> Value {
             "logout",
             "whoami",
             "overnight",
+            "overnight.transactions",
             "broker.context.show",
             "broker.context.select",
             "broker.overview",
@@ -597,6 +766,12 @@ fn machine_capabilities(config: &AppConfig) -> Value {
             "broker.transactions",
             "broker.transaction.details",
             "broker.holdings",
+            "broker.portfolio-groups",
+            "broker.portfolio-groups.create",
+            "broker.portfolio-groups.update",
+            "broker.portfolio-groups.delete",
+            "broker.portfolio-groups.assign",
+            "broker.portfolio-groups.unassign",
             "broker.watchlist",
             "broker.watchlist.add",
             "broker.watchlist.remove",
@@ -610,6 +785,7 @@ fn machine_capabilities(config: &AppConfig) -> Value {
             "broker.price-alerts.remove",
             "broker.savings-plans",
             "broker.savings-plans.add",
+            "broker.savings-plans.config",
             "broker.savings-plans.remove",
             "broker.trade.buy",
             "broker.trade.sell",
@@ -625,11 +801,13 @@ fn machine_capabilities(config: &AppConfig) -> Value {
         "workflows": {
             "broker.trade.buy": {
                 "mode": "two_phase_confirmation",
-                "phase_1": "Run trade buy args without --confirm to preview and receive confirmation id.",
-                "phase_2": "Repeat the same trade buy args with --confirm <id> to submit, and add --accept-unsuitable when phase 1 marks the instrument as not suitable.",
+                "phase_1": "Run trade buy args with exactly one of --amount or --shares, and without --confirm, to preview and receive confirmation id.",
+                "phase_2": "Repeat the same trade buy args with exactly one of --amount or --shares and --confirm <id> to submit, and add --accept-unsuitable when phase 1 marks the instrument as not suitable.",
                 "preferred_output": "json",
                 "phase_1_command_template_json": "sc broker trade buy --isin <ISIN> --amount <AMOUNT> --order-type <market|limit|stop> [--limit-price <LIMIT_PRICE>] [--stop-price <STOP_PRICE>] [--venue <VENUE>] --json",
                 "phase_2_command_template_json": "sc broker trade buy --isin <ISIN> --amount <AMOUNT> --order-type <market|limit|stop> [--limit-price <LIMIT_PRICE>] [--stop-price <STOP_PRICE>] [--venue <VENUE>] --confirm <CONFIRMATION_ID> [--accept-unsuitable] --json",
+                "phase_1_command_template_json_shares": "sc broker trade buy --isin <ISIN> --shares <SHARES> --order-type <market|limit|stop> [--limit-price <LIMIT_PRICE>] [--stop-price <STOP_PRICE>] [--venue <VENUE>] --json",
+                "phase_2_command_template_json_shares": "sc broker trade buy --isin <ISIN> --shares <SHARES> --order-type <market|limit|stop> [--limit-price <LIMIT_PRICE>] [--stop-price <STOP_PRICE>] [--venue <VENUE>] --confirm <CONFIRMATION_ID> [--accept-unsuitable] --json",
                 "raw_json_not_recommended_for_humans": true,
                 "phase_1_presentation_requirement": {
                     "rule_id": "pre_trade_full_disclosure_v1",
@@ -668,6 +846,29 @@ fn machine_capabilities(config: &AppConfig) -> Value {
                     "display_null_as_literal": true,
                     "raw_json_only_on_user_request": true
                 }
+            },
+            "broker.savings-plans.add": {
+                "mode": "two_phase_confirmation",
+                "phase_1": "Run savings-plans add without --confirm to preview the full ex-ante cost disclosure and receive a confirmation id.",
+                "phase_2": "Repeat the identical savings-plans add arguments with --confirm <id> only after explicit affirmative client confirmation in a separate interaction.",
+                "preferred_output": "json",
+                "phase_1_command_template_json": "sc broker savings-plans add --isin <ISIN> --amount <AMOUNT> [--frequency <FREQUENCY>] [--day-of-month <DAY>] [--year-month <YYYY-MM>] [--dynamization-rate <RATE>] [--payment-method <METHOD>] [--appropriateness-id <ID>] [--acknowledged-appropriateness-warning-version <VERSION>] --json",
+                "phase_2_command_template_json": "sc broker savings-plans add --isin <ISIN> --amount <AMOUNT> [same options] --confirm <CONFIRMATION_ID> --json",
+                "raw_json_not_recommended_for_humans": true,
+                "phase_1_presentation_requirement": {
+                    "rule_id": SAVINGS_PLAN_COMPLIANCE_RULE_ID,
+                    "must_present_all_information": true,
+                    "instruction": "Before running phase 2, you MUST present all phase-1 savings-plan information in a human-readable summary without omitting or changing values. Then obtain an explicit affirmative confirmation in a separate interaction. You MUST NOT execute phase 2 automatically, implicitly, or in the same step as phase 1 output.",
+                    "requires_explicit_user_confirmation_between_phases": true,
+                    "forbid_automatic_phase_2_execution": true,
+                    "confirmation_must_be_separate_step": true,
+                    "format": SAVINGS_PLAN_PRESENTATION_FORMAT,
+                    "section_order": ["savings_plan", "ex_ante_costs", "confirmation"],
+                    "required_leaf_paths": savings_plan_required_leaf_paths(),
+                    "preserve_exact_values": true,
+                    "display_null_as_literal": true,
+                    "raw_json_only_on_user_request": true
+                }
             }
         },
         "local_trade_controls": trade_controls,
@@ -680,13 +881,16 @@ fn machine_capabilities(config: &AppConfig) -> Value {
     })
 }
 
-fn machine_command_name(command: &Commands) -> &'static str {
+pub(crate) fn machine_command_name(command: &Commands) -> &'static str {
     match command {
         Commands::InstallationCode(_) => "installation-code",
         Commands::Login(_) => "login",
         Commands::Logout(_) => "logout",
         Commands::Whoami(_) => "whoami",
-        Commands::Overnight(_) => "overnight",
+        Commands::Overnight(args) => match &args.command {
+            Some(OvernightCommand::Transactions(_)) => "overnight.transactions",
+            None => "overnight",
+        },
         Commands::Broker(broker) => match &broker.command {
             BrokerCommand::Context(context) => match &context.command {
                 BrokerContextCommand::Show(_) => "broker.context.show",
@@ -700,6 +904,16 @@ fn machine_command_name(command: &Commands) -> &'static str {
                 BrokerTransactionCommand::Details(_) => "broker.transaction.details",
             },
             BrokerCommand::Holdings(_) => "broker.holdings",
+            BrokerCommand::PortfolioGroups(args) => match &args.command {
+                Some(BrokerPortfolioGroupsCommand::Create(_)) => "broker.portfolio-groups.create",
+                Some(BrokerPortfolioGroupsCommand::Update(_)) => "broker.portfolio-groups.update",
+                Some(BrokerPortfolioGroupsCommand::Delete(_)) => "broker.portfolio-groups.delete",
+                Some(BrokerPortfolioGroupsCommand::Assign(_)) => "broker.portfolio-groups.assign",
+                Some(BrokerPortfolioGroupsCommand::Unassign(_)) => {
+                    "broker.portfolio-groups.unassign"
+                }
+                None => "broker.portfolio-groups",
+            },
             BrokerCommand::Watchlist(args) => match &args.command {
                 Some(BrokerWatchlistCommand::Add(_)) => "broker.watchlist.add",
                 Some(BrokerWatchlistCommand::Remove(_)) => "broker.watchlist.remove",
@@ -719,6 +933,7 @@ fn machine_command_name(command: &Commands) -> &'static str {
             },
             BrokerCommand::SavingsPlans(args) => match &args.command {
                 Some(BrokerSavingsPlansCommand::Add(_)) => "broker.savings-plans.add",
+                Some(BrokerSavingsPlansCommand::Config(_)) => "broker.savings-plans.config",
                 Some(BrokerSavingsPlansCommand::Remove(_)) => "broker.savings-plans.remove",
                 None => "broker.savings-plans",
             },
@@ -734,13 +949,12 @@ fn machine_command_name(command: &Commands) -> &'static str {
 
 fn run_installation_code_command(
     args: InstallationCodeArgs,
-    raw_command_name: &'static str,
-    raw_machine_output: bool,
+    execution_context: ExecutionContext,
 ) -> Result<()> {
     let value = match load_or_create_installation_code() {
         Ok(value) => value,
-        Err(err) if raw_machine_output => {
-            let exit_code = print_error(raw_command_name, &err);
+        Err(err) if execution_context.requests_machine_output() => {
+            let exit_code = print_error(execution_context.command_name, &err);
             std::process::exit(exit_code);
         }
         Err(err) => return Err(err),
@@ -748,7 +962,7 @@ fn run_installation_code_command(
 
     if args.json {
         print_success(
-            raw_command_name,
+            execution_context.command_name,
             json!({
                 "installation_code": value.installation_code,
                 "display_code": value.display_code,
@@ -837,6 +1051,7 @@ mod tests {
         AppConfig, AuthConfig, DpopKeyBackend, EnvConfig, RuntimeAuthConfig,
         SessionBackendPreference,
     };
+    use crate::machine::classify_error;
     use crate::session::{FileStore, LoginSource, Session, StorageBackend, StoredSession};
 
     struct EnvGuard {
@@ -943,12 +1158,62 @@ mod tests {
     #[test]
     fn overnight_machine_command_name_and_json_flag_are_wired() {
         let command = Commands::Overnight(OvernightArgs {
+            command: None,
             savings_account_id: Some("sav-1".to_string()),
             json: true,
         });
 
         assert!(command_requests_json_envelope(&command));
         assert_eq!(machine_command_name(&command), "overnight");
+    }
+
+    #[test]
+    fn overnight_transactions_machine_command_name_and_json_flag_are_wired() {
+        let command = Commands::Overnight(OvernightArgs {
+            command: Some(OvernightCommand::Transactions(
+                crate::cli::OvernightTransactionsArgs {
+                    savings_account_id: Some("sav-1".to_string()),
+                    page_size: 20,
+                    cursor: None,
+                    type_filter: Vec::new(),
+                    search_term: None,
+                    from_time: None,
+                    to_time: None,
+                    json: true,
+                },
+            )),
+            savings_account_id: None,
+            json: false,
+        });
+
+        assert!(command_requests_json_envelope(&command));
+        assert_eq!(machine_command_name(&command), "overnight.transactions");
+    }
+
+    #[test]
+    fn overnight_transactions_inherit_parent_selection_and_json_flags() {
+        let Cli { command } = Cli::parse_from([
+            "sc",
+            "overnight",
+            "--savings-account-id",
+            "sav-parent",
+            "--json",
+            "transactions",
+        ]);
+
+        let normalized = normalize_command(command).expect("normalize");
+        assert!(command_requests_json_envelope(&normalized));
+        assert_eq!(machine_command_name(&normalized), "overnight.transactions");
+        match normalized {
+            Commands::Overnight(crate::cli::OvernightArgs {
+                command: Some(OvernightCommand::Transactions(args)),
+                ..
+            }) => {
+                assert_eq!(args.savings_account_id.as_deref(), Some("sav-parent"));
+                assert!(args.json);
+            }
+            _ => panic!("expected normalized overnight transactions command"),
+        }
     }
 
     #[test]
@@ -963,6 +1228,259 @@ mod tests {
 
         assert!(command_requests_json_envelope(&command));
         assert_eq!(machine_command_name(&command), "broker.chart");
+    }
+
+    #[test]
+    fn broker_portfolio_groups_machine_command_name_and_json_flag_are_wired() {
+        let command = Commands::Broker(crate::cli::BrokerArgs {
+            command: BrokerCommand::PortfolioGroups(crate::cli::BrokerPortfolioGroupsArgs {
+                command: None,
+                portfolio_id: Some("portfolio-1".to_string()),
+                group_id: Some("group-1".to_string()),
+                json: true,
+            }),
+        });
+
+        assert!(command_requests_json_envelope(&command));
+        assert_eq!(machine_command_name(&command), "broker.portfolio-groups");
+    }
+
+    #[test]
+    fn portfolio_groups_lifecycle_inherits_parent_flags_and_uses_leaf_command_name() {
+        let Cli { command } = Cli::parse_from([
+            "sc",
+            "broker",
+            "portfolio-groups",
+            "--portfolio-id",
+            "p-parent",
+            "--json",
+            "create",
+            "--name",
+            "AI portfolio",
+        ]);
+
+        let normalized = normalize_command(command).expect("command should normalize");
+        assert!(command_requests_json_envelope(&normalized));
+        assert_eq!(
+            machine_command_name(&normalized),
+            "broker.portfolio-groups.create"
+        );
+        match normalized {
+            Commands::Broker(crate::cli::BrokerArgs {
+                command: BrokerCommand::PortfolioGroups(args),
+            }) => match args.command {
+                Some(BrokerPortfolioGroupsCommand::Create(create_args)) => {
+                    assert_eq!(create_args.portfolio_id.as_deref(), Some("p-parent"));
+                    assert!(create_args.json);
+                }
+                _ => panic!("expected create command"),
+            },
+            _ => panic!("expected portfolio groups command"),
+        }
+    }
+
+    #[test]
+    fn portfolio_groups_lifecycle_rejects_parent_group_id() {
+        let Cli { command } = Cli::parse_from([
+            "sc",
+            "broker",
+            "portfolio-groups",
+            "--group-id",
+            "group-parent",
+            "delete",
+            "--group-id",
+            "group-child",
+        ]);
+
+        let err = normalize_command(command).expect_err("parent group id must be rejected");
+
+        assert_eq!(classify_error(&err).code, "broker_input_invalid");
+    }
+
+    #[test]
+    fn portfolio_groups_lifecycle_inherits_parent_flags_for_every_leaf() {
+        let cases: [(&[&str], &str); 5] = [
+            (
+                &[
+                    "sc",
+                    "broker",
+                    "portfolio-groups",
+                    "--portfolio-id",
+                    "p-parent",
+                    "--json",
+                    "create",
+                    "--name",
+                    "AI portfolio",
+                ],
+                "broker.portfolio-groups.create",
+            ),
+            (
+                &[
+                    "sc",
+                    "broker",
+                    "portfolio-groups",
+                    "--portfolio-id",
+                    "p-parent",
+                    "--json",
+                    "update",
+                    "--group-id",
+                    "group-1",
+                    "--name",
+                    "Renamed",
+                ],
+                "broker.portfolio-groups.update",
+            ),
+            (
+                &[
+                    "sc",
+                    "broker",
+                    "portfolio-groups",
+                    "--portfolio-id",
+                    "p-parent",
+                    "--json",
+                    "delete",
+                    "--group-id",
+                    "group-1",
+                ],
+                "broker.portfolio-groups.delete",
+            ),
+            (
+                &[
+                    "sc",
+                    "broker",
+                    "portfolio-groups",
+                    "--portfolio-id",
+                    "p-parent",
+                    "--json",
+                    "assign",
+                    "--group-id",
+                    "group-1",
+                    "--isin",
+                    "US0378331005",
+                ],
+                "broker.portfolio-groups.assign",
+            ),
+            (
+                &[
+                    "sc",
+                    "broker",
+                    "portfolio-groups",
+                    "--portfolio-id",
+                    "p-parent",
+                    "--json",
+                    "unassign",
+                    "--group-id",
+                    "group-1",
+                    "--isin",
+                    "US0378331005",
+                ],
+                "broker.portfolio-groups.unassign",
+            ),
+        ];
+
+        for (args, expected_command_name) in cases {
+            let Cli { command } = Cli::parse_from(args);
+            let normalized = normalize_command(command).expect("command should normalize");
+
+            assert!(command_requests_json_envelope(&normalized));
+            assert_eq!(machine_command_name(&normalized), expected_command_name);
+            match normalized {
+                Commands::Broker(crate::cli::BrokerArgs {
+                    command: BrokerCommand::PortfolioGroups(args),
+                }) => match args.command {
+                    Some(BrokerPortfolioGroupsCommand::Create(args)) => {
+                        assert_eq!(args.portfolio_id.as_deref(), Some("p-parent"));
+                        assert!(args.json);
+                    }
+                    Some(BrokerPortfolioGroupsCommand::Update(args)) => {
+                        assert_eq!(args.portfolio_id.as_deref(), Some("p-parent"));
+                        assert!(args.json);
+                    }
+                    Some(BrokerPortfolioGroupsCommand::Delete(args)) => {
+                        assert_eq!(args.portfolio_id.as_deref(), Some("p-parent"));
+                        assert!(args.json);
+                    }
+                    Some(BrokerPortfolioGroupsCommand::Assign(args)) => {
+                        assert_eq!(args.portfolio_id.as_deref(), Some("p-parent"));
+                        assert!(args.json);
+                    }
+                    Some(BrokerPortfolioGroupsCommand::Unassign(args)) => {
+                        assert_eq!(args.portfolio_id.as_deref(), Some("p-parent"));
+                        assert!(args.json);
+                    }
+                    None => panic!("expected lifecycle command"),
+                },
+                _ => panic!("expected portfolio groups command"),
+            }
+        }
+    }
+
+    #[test]
+    fn portfolio_groups_lifecycle_rejects_parent_group_id_for_every_leaf() {
+        let cases: [&[&str]; 5] = [
+            &[
+                "sc",
+                "broker",
+                "portfolio-groups",
+                "--group-id",
+                "group-parent",
+                "create",
+                "--name",
+                "AI portfolio",
+            ],
+            &[
+                "sc",
+                "broker",
+                "portfolio-groups",
+                "--group-id",
+                "group-parent",
+                "update",
+                "--group-id",
+                "group-child",
+                "--name",
+                "Renamed",
+            ],
+            &[
+                "sc",
+                "broker",
+                "portfolio-groups",
+                "--group-id",
+                "group-parent",
+                "delete",
+                "--group-id",
+                "group-child",
+            ],
+            &[
+                "sc",
+                "broker",
+                "portfolio-groups",
+                "--group-id",
+                "group-parent",
+                "assign",
+                "--group-id",
+                "group-child",
+                "--isin",
+                "US0378331005",
+            ],
+            &[
+                "sc",
+                "broker",
+                "portfolio-groups",
+                "--group-id",
+                "group-parent",
+                "unassign",
+                "--group-id",
+                "group-child",
+                "--isin",
+                "US0378331005",
+            ],
+        ];
+
+        for args in cases {
+            let Cli { command } = Cli::parse_from(args);
+            let err = normalize_command(command).expect_err("parent group id must be rejected");
+            assert_eq!(classify_error(&err).code, "broker_input_invalid");
+        }
     }
 
     #[test]
@@ -1221,5 +1739,67 @@ mod tests {
             },
             _ => panic!("expected broker savings-plans command"),
         }
+    }
+
+    #[test]
+    fn savings_plan_config_inherits_parent_portfolio_and_json_flags() {
+        let Cli { command } = Cli::parse_from([
+            "sc",
+            "broker",
+            "savings-plans",
+            "--portfolio-id",
+            "p-parent",
+            "--json",
+            "config",
+            "--isin",
+            "US0378331005",
+        ]);
+
+        let normalized = normalize_command(command).expect("command should normalize");
+        assert!(command_requests_json_envelope(&normalized));
+
+        match normalized {
+            Commands::Broker(BrokerArgs {
+                command: BrokerCommand::SavingsPlans(args),
+            }) => match args.command {
+                Some(BrokerSavingsPlansCommand::Config(config_args)) => {
+                    assert_eq!(config_args.portfolio_id.as_deref(), Some("p-parent"));
+                    assert!(config_args.json);
+                }
+                _ => panic!("expected config subcommand"),
+            },
+            _ => panic!("expected broker savings-plans command"),
+        }
+    }
+
+    #[test]
+    fn capabilities_describe_savings_plan_two_phase_disclosure() {
+        let capabilities = machine_capabilities(&AppConfig::default());
+        let workflow = &capabilities["workflows"]["broker.savings-plans.add"];
+
+        assert_eq!(workflow["mode"], "two_phase_confirmation");
+        assert!(
+            workflow["phase_1"]
+                .as_str()
+                .expect("phase 1 description")
+                .contains("without --confirm")
+        );
+        assert!(
+            workflow["phase_2"]
+                .as_str()
+                .expect("phase 2 description")
+                .contains("separate interaction")
+        );
+        assert_eq!(
+            workflow["phase_1_presentation_requirement"]["rule_id"],
+            "savings_plan_ex_ante_full_disclosure_v1"
+        );
+        assert!(
+            workflow["phase_1_presentation_requirement"]["required_leaf_paths"]
+                .as_array()
+                .expect("required paths")
+                .iter()
+                .any(|path| path == "ex_ante_costs.exitCosts.total.amount")
+        );
     }
 }

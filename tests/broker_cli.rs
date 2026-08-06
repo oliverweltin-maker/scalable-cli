@@ -802,6 +802,210 @@ fn broker_watchlist_remove_parent_json_without_session_returns_no_session_code()
 }
 
 #[test]
+fn broker_portfolio_groups_json_without_session_returns_no_session_code() {
+    assert_json_no_session(
+        &[
+            "broker",
+            "portfolio-groups",
+            "--group-id",
+            "group-1",
+            "--json",
+        ],
+        "broker.portfolio-groups",
+    );
+}
+
+#[test]
+fn broker_portfolio_groups_mutation_json_without_session_returns_leaf_command_codes() {
+    assert_json_no_session(
+        &[
+            "broker",
+            "portfolio-groups",
+            "--json",
+            "create",
+            "--name",
+            "AI portfolio",
+        ],
+        "broker.portfolio-groups.create",
+    );
+    assert_json_no_session(
+        &[
+            "broker",
+            "portfolio-groups",
+            "update",
+            "--group-id",
+            "group-1",
+            "--name",
+            "Renamed",
+            "--json",
+        ],
+        "broker.portfolio-groups.update",
+    );
+    assert_json_no_session(
+        &[
+            "broker",
+            "portfolio-groups",
+            "delete",
+            "--group-id",
+            "group-1",
+            "--json",
+        ],
+        "broker.portfolio-groups.delete",
+    );
+    assert_json_no_session(
+        &[
+            "broker",
+            "portfolio-groups",
+            "assign",
+            "--group-id",
+            "group-1",
+            "--isin",
+            "US0378331005",
+            "--json",
+        ],
+        "broker.portfolio-groups.assign",
+    );
+    assert_json_no_session(
+        &[
+            "broker",
+            "portfolio-groups",
+            "unassign",
+            "--group-id",
+            "group-1",
+            "--isin",
+            "US0378331005",
+            "--json",
+        ],
+        "broker.portfolio-groups.unassign",
+    );
+}
+
+#[test]
+fn broker_portfolio_groups_update_requires_a_field_to_change() {
+    let (_tmp, config_dir) = temp_config_dir();
+
+    sc_command()
+        .env("SC_CONFIG_DIR", &config_dir)
+        .args([
+            "broker",
+            "portfolio-groups",
+            "update",
+            "--group-id",
+            "group-1",
+            "--json",
+        ])
+        .assert()
+        .code(10)
+        .stdout(predicate::str::contains(
+            "\"command\":\"broker.portfolio-groups.update\"",
+        ))
+        .stdout(predicate::str::contains(
+            "\"code\":\"broker_input_invalid\"",
+        ));
+}
+
+fn assert_portfolio_groups_lifecycle_local_read_only(
+    args: &[&str],
+    command: &str,
+    operation: &str,
+) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config_dir = tmp.path().to_string_lossy().to_string();
+    write_test_config(tmp.path());
+    let thumbprint = ensure_runtime_dpop_key(tmp.path());
+    write_test_session_with_options(
+        tmp.path(),
+        "test-access-token",
+        Some("local_read_only"),
+        Some(thumbprint.as_str()),
+    );
+    write_test_broker_context(tmp.path(), "p-1", "portfolio-1");
+
+    sc_command()
+        .env("SC_CONFIG_DIR", &config_dir)
+        .args(args)
+        .assert()
+        .code(10)
+        .stdout(predicate::str::contains(format!(
+            "\"command\":\"{command}\""
+        )))
+        .stdout(predicate::str::contains("\"code\":\"local_read_only\""))
+        .stdout(predicate::str::contains(format!(
+            "local read-only mode blocks write operation '{operation}'"
+        )));
+}
+
+#[test]
+fn broker_portfolio_groups_mutations_local_read_only_blocks_each_mutation() {
+    assert_portfolio_groups_lifecycle_local_read_only(
+        &[
+            "broker",
+            "portfolio-groups",
+            "create",
+            "--name",
+            "AI portfolio",
+            "--json",
+        ],
+        "broker.portfolio-groups.create",
+        "BrokerCreatePortfolioGroup",
+    );
+    assert_portfolio_groups_lifecycle_local_read_only(
+        &[
+            "broker",
+            "portfolio-groups",
+            "update",
+            "--group-id",
+            "group-1",
+            "--name",
+            "Renamed",
+            "--json",
+        ],
+        "broker.portfolio-groups.update",
+        "BrokerUpdatePortfolioGroup",
+    );
+    assert_portfolio_groups_lifecycle_local_read_only(
+        &[
+            "broker",
+            "portfolio-groups",
+            "delete",
+            "--group-id",
+            "group-1",
+            "--json",
+        ],
+        "broker.portfolio-groups.delete",
+        "BrokerDeletePortfolioGroup",
+    );
+    assert_portfolio_groups_lifecycle_local_read_only(
+        &[
+            "broker",
+            "portfolio-groups",
+            "assign",
+            "--group-id",
+            "group-1",
+            "--isin",
+            "US0378331005",
+            "--json",
+        ],
+        "broker.portfolio-groups.assign",
+        "BrokerAssignPortfolioGroupItems",
+    );
+    assert_portfolio_groups_lifecycle_local_read_only(
+        &[
+            "broker",
+            "portfolio-groups",
+            "unassign",
+            "--group-id",
+            "group-1",
+            "--isin",
+            "US0378331005",
+            "--json",
+        ],
+        "broker.portfolio-groups.unassign",
+        "BrokerUnassignPortfolioGroupItems",
+    );
+}
+
+#[test]
 fn broker_derivatives_search_json_invalid_underlying_returns_broker_input_invalid_code() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let config_dir = tmp.path().to_string_lossy().to_string();
@@ -835,6 +1039,140 @@ fn broker_derivatives_search_json_invalid_underlying_returns_broker_input_invali
     assert_eq!(
         envelope["error"]["message"],
         json!("Broker input invalid: field 'underlying' must be a valid ISIN")
+    );
+}
+
+#[test]
+fn broker_savings_plans_config_json_invalid_isin_returns_savings_plan_input_invalid_code() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config_dir = tmp.path().to_string_lossy().to_string();
+    write_test_config(tmp.path());
+    let thumbprint = ensure_runtime_dpop_key(tmp.path());
+    write_test_session_with_options(
+        tmp.path(),
+        "test-access-token",
+        None,
+        Some(thumbprint.as_str()),
+    );
+
+    let assert = sc_command()
+        .env("SC_CONFIG_DIR", &config_dir)
+        .args([
+            "broker",
+            "savings-plans",
+            "config",
+            "--portfolio-id",
+            "portfolio-1",
+            "--isin",
+            "x",
+            "--json",
+        ])
+        .assert()
+        .failure()
+        .code(10);
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("utf8 stdout");
+    let envelope: Value = serde_json::from_str(&stdout).expect("machine json envelope");
+    assert_eq!(envelope["command"], json!("broker.savings-plans.config"));
+    assert_eq!(
+        envelope["error"]["code"],
+        json!("savings_plan_input_invalid")
+    );
+    assert_eq!(
+        envelope["error"]["message"],
+        json!(
+            "SAVINGS_PLAN_INPUT_INVALID: Broker input invalid: field 'isin' must be a valid ISIN"
+        )
+    );
+}
+
+#[test]
+fn broker_savings_plans_add_json_invalid_isin_returns_savings_plan_input_invalid_code() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config_dir = tmp.path().to_string_lossy().to_string();
+    write_test_config(tmp.path());
+    let thumbprint = ensure_runtime_dpop_key(tmp.path());
+    write_test_session_with_options(
+        tmp.path(),
+        "test-access-token",
+        None,
+        Some(thumbprint.as_str()),
+    );
+
+    let assert = sc_command()
+        .env("SC_CONFIG_DIR", &config_dir)
+        .args([
+            "broker",
+            "savings-plans",
+            "add",
+            "--portfolio-id",
+            "portfolio-1",
+            "--isin",
+            "x",
+            "--amount",
+            "100",
+            "--json",
+        ])
+        .assert()
+        .failure()
+        .code(10);
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("utf8 stdout");
+    let envelope: Value = serde_json::from_str(&stdout).expect("machine json envelope");
+    assert_eq!(envelope["command"], json!("broker.savings-plans.add"));
+    assert_eq!(
+        envelope["error"]["code"],
+        json!("savings_plan_input_invalid")
+    );
+    assert_eq!(
+        envelope["error"]["message"],
+        json!(
+            "SAVINGS_PLAN_INPUT_INVALID: Broker input invalid: field 'isin' must be a valid ISIN"
+        )
+    );
+}
+
+#[test]
+fn broker_savings_plans_remove_json_invalid_isin_returns_savings_plan_input_invalid_code() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config_dir = tmp.path().to_string_lossy().to_string();
+    write_test_config(tmp.path());
+    let thumbprint = ensure_runtime_dpop_key(tmp.path());
+    write_test_session_with_options(
+        tmp.path(),
+        "test-access-token",
+        None,
+        Some(thumbprint.as_str()),
+    );
+
+    let assert = sc_command()
+        .env("SC_CONFIG_DIR", &config_dir)
+        .args([
+            "broker",
+            "savings-plans",
+            "remove",
+            "--portfolio-id",
+            "portfolio-1",
+            "--isin",
+            "x",
+            "--json",
+        ])
+        .assert()
+        .failure()
+        .code(10);
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("utf8 stdout");
+    let envelope: Value = serde_json::from_str(&stdout).expect("machine json envelope");
+    assert_eq!(envelope["command"], json!("broker.savings-plans.remove"));
+    assert_eq!(
+        envelope["error"]["code"],
+        json!("savings_plan_input_invalid")
+    );
+    assert_eq!(
+        envelope["error"]["message"],
+        json!(
+            "SAVINGS_PLAN_INPUT_INVALID: Broker input invalid: field 'isin' must be a valid ISIN"
+        )
     );
 }
 
@@ -885,7 +1223,11 @@ fn broker_watchlist_add_parent_json_invalid_flags_return_validation_envelope() {
         ))
         .stdout(predicate::str::contains(
             "\"code\":\"broker_input_invalid\"",
-        ));
+        ))
+        .stdout(predicate::str::contains(
+            "\"hints\":[\"Check broker command inputs and retry.\"]",
+        ))
+        .stderr(predicate::str::is_empty());
 }
 
 #[test]
@@ -914,7 +1256,11 @@ fn broker_watchlist_add_parent_json_blank_quote_source_returns_validation_envelo
         .stdout(predicate::str::contains(
             "\"code\":\"broker_input_invalid\"",
         ))
-        .stdout(predicate::str::contains("--quote-source"));
+        .stdout(predicate::str::contains(
+            "\"hints\":[\"Check broker command inputs and retry.\"]",
+        ))
+        .stdout(predicate::str::contains("--quote-source"))
+        .stderr(predicate::str::is_empty());
 }
 
 #[test]
@@ -939,6 +1285,21 @@ fn broker_savings_plans_add_json_without_session_returns_no_session_code() {
             "--json",
         ],
         "broker.savings-plans.add",
+    );
+}
+
+#[test]
+fn broker_savings_plans_config_json_without_session_returns_no_session_code() {
+    assert_json_no_session(
+        &[
+            "broker",
+            "savings-plans",
+            "config",
+            "--isin",
+            "US0378331005",
+            "--json",
+        ],
+        "broker.savings-plans.config",
     );
 }
 
@@ -1052,7 +1413,11 @@ fn broker_price_alerts_add_parent_json_invalid_flags_return_broker_input_invalid
         .stdout(predicate::str::contains(
             "\"code\":\"broker_input_invalid\"",
         ))
-        .stdout(predicate::str::contains("--active-only"));
+        .stdout(predicate::str::contains("--active-only"))
+        .stdout(predicate::str::contains(
+            "\"hints\":[\"Check broker command inputs and retry.\"]",
+        ))
+        .stderr(predicate::str::is_empty());
 }
 
 #[test]
@@ -1079,7 +1444,11 @@ fn broker_price_alerts_remove_parent_json_invalid_flags_return_broker_input_inva
         .stdout(predicate::str::contains(
             "\"code\":\"broker_input_invalid\"",
         ))
-        .stdout(predicate::str::contains("--active-only"));
+        .stdout(predicate::str::contains("--active-only"))
+        .stdout(predicate::str::contains(
+            "\"hints\":[\"Check broker command inputs and retry.\"]",
+        ))
+        .stderr(predicate::str::is_empty());
 }
 
 #[test]
@@ -1096,6 +1465,21 @@ fn broker_savings_plans_add_parent_json_without_session_returns_no_session_code(
             "100",
         ],
         "broker.savings-plans.add",
+    );
+}
+
+#[test]
+fn broker_savings_plans_config_parent_json_without_session_returns_no_session_code() {
+    assert_json_no_session(
+        &[
+            "broker",
+            "savings-plans",
+            "--json",
+            "config",
+            "--isin",
+            "US0378331005",
+        ],
+        "broker.savings-plans.config",
     );
 }
 
@@ -1140,6 +1524,31 @@ fn broker_trade_buy_without_session_fails() {
 }
 
 #[test]
+fn broker_trade_buy_with_shares_without_session_fails() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config_dir = tmp.path().to_string_lossy().to_string();
+    write_test_config(tmp.path());
+
+    sc_command()
+        .env("SC_CONFIG_DIR", &config_dir)
+        .args([
+            "broker",
+            "trade",
+            "buy",
+            "--isin",
+            "US0378331005",
+            "--shares",
+            "2",
+        ])
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("No active session")
+                .or(predicate::str::contains("Platform secure storage failure")),
+        );
+}
+
+#[test]
 fn broker_trade_buy_json_without_session_returns_no_session_code() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let config_dir = tmp.path().to_string_lossy().to_string();
@@ -1161,6 +1570,122 @@ fn broker_trade_buy_json_without_session_returns_no_session_code() {
         .failure()
         .stdout(predicate::str::contains("\"command\":\"broker.trade.buy\""))
         .stdout(predicate::str::contains("\"code\":\"no_session\""));
+}
+
+#[test]
+fn broker_trade_buy_shares_json_without_session_returns_no_session_code() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config_dir = tmp.path().to_string_lossy().to_string();
+    write_test_config(tmp.path());
+
+    sc_command()
+        .env("SC_CONFIG_DIR", &config_dir)
+        .args([
+            "broker",
+            "trade",
+            "buy",
+            "--isin",
+            "US0378331005",
+            "--shares",
+            "2",
+            "--json",
+        ])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("\"command\":\"broker.trade.buy\""))
+        .stdout(predicate::str::contains("\"code\":\"no_session\""));
+}
+
+#[test]
+fn broker_trade_buy_json_rejects_amount_and_shares_together_before_session_lookup() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config_dir = tmp.path().to_string_lossy().to_string();
+    write_test_config(tmp.path());
+
+    sc_command()
+        .env("SC_CONFIG_DIR", &config_dir)
+        .args([
+            "broker",
+            "trade",
+            "buy",
+            "--isin",
+            "US0378331005",
+            "--amount",
+            "500",
+            "--shares",
+            "2",
+            "--json",
+        ])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("\"command\":\"broker.trade.buy\""))
+        .stdout(predicate::str::contains("\"code\":\"trade_input_invalid\""))
+        .stdout(predicate::str::contains("--amount or --shares"));
+}
+
+#[test]
+fn broker_trade_buy_rejects_amount_and_shares_together_before_session_lookup() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config_dir = tmp.path().to_string_lossy().to_string();
+    write_test_config(tmp.path());
+
+    sc_command()
+        .env("SC_CONFIG_DIR", &config_dir)
+        .args([
+            "broker",
+            "trade",
+            "buy",
+            "--isin",
+            "US0378331005",
+            "--amount",
+            "500",
+            "--shares",
+            "2",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--amount or --shares"));
+}
+
+#[test]
+fn broker_trade_buy_json_requires_amount_or_shares_before_session_lookup() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config_dir = tmp.path().to_string_lossy().to_string();
+    write_test_config(tmp.path());
+
+    sc_command()
+        .env("SC_CONFIG_DIR", &config_dir)
+        .args(["broker", "trade", "buy", "--isin", "US0378331005", "--json"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("\"command\":\"broker.trade.buy\""))
+        .stdout(predicate::str::contains("\"code\":\"trade_input_invalid\""))
+        .stdout(predicate::str::contains("--amount or --shares"));
+}
+
+#[test]
+fn broker_trade_buy_json_rejects_fractional_shares_before_session_lookup() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config_dir = tmp.path().to_string_lossy().to_string();
+    write_test_config(tmp.path());
+
+    sc_command()
+        .env("SC_CONFIG_DIR", &config_dir)
+        .args([
+            "broker",
+            "trade",
+            "buy",
+            "--isin",
+            "US0378331005",
+            "--shares",
+            "1.5",
+            "--json",
+        ])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("\"command\":\"broker.trade.buy\""))
+        .stdout(predicate::str::contains("\"code\":\"trade_input_invalid\""))
+        .stdout(predicate::str::contains("positive whole number"));
 }
 
 #[test]

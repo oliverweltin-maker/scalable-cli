@@ -1,6 +1,15 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::helpers::{broker_transactions_status_help, broker_transactions_type_filter_help};
+use crate::overnight_queries::overnight_transactions_type_filter_help;
+
+fn non_empty_trimmed_value(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("value must not be blank".to_string());
+    }
+    Ok(trimmed.to_string())
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -63,8 +72,53 @@ pub struct WhoamiArgs {
 
 #[derive(Debug, Args)]
 pub struct OvernightArgs {
+    #[command(subcommand)]
+    pub command: Option<OvernightCommand>,
+
     #[arg(long, help = "Overnight savings account id override")]
     pub savings_account_id: Option<String>,
+
+    #[arg(long, help = "Print compact JSON")]
+    pub json: bool,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum OvernightCommand {
+    #[command(about = "List overnight savings account transactions with filters and pagination")]
+    Transactions(OvernightTransactionsArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct OvernightTransactionsArgs {
+    #[arg(long, help = "Overnight savings account id override")]
+    pub savings_account_id: Option<String>,
+
+    #[arg(
+        long,
+        default_value_t = 20,
+        value_parser = clap::value_parser!(u16).range(1..=100),
+        help = "Number of transactions per page (1..100)"
+    )]
+    pub page_size: u16,
+
+    #[arg(long, help = "Pagination cursor from a previous response")]
+    pub cursor: Option<String>,
+
+    #[arg(
+        long = "type-filter",
+        value_name = "FILTER",
+        help = overnight_transactions_type_filter_help()
+    )]
+    pub type_filter: Vec<String>,
+
+    #[arg(long, help = "Optional free-text transaction search term")]
+    pub search_term: Option<String>,
+
+    #[arg(long, help = "From timestamp in ISO-8601 format")]
+    pub from_time: Option<String>,
+
+    #[arg(long, help = "To timestamp in ISO-8601 format")]
+    pub to_time: Option<String>,
 
     #[arg(long, help = "Print compact JSON")]
     pub json: bool,
@@ -95,6 +149,8 @@ pub enum BrokerCommand {
     Transaction(BrokerTransactionArgs),
     #[command(about = "Get broker portfolio holdings")]
     Holdings(BrokerHoldingsArgs),
+    #[command(about = "List broker portfolio groups and ungrouped holdings")]
+    PortfolioGroups(BrokerPortfolioGroupsArgs),
     #[command(about = "List, add, or remove broker portfolio watchlist entries")]
     Watchlist(BrokerWatchlistArgs),
     #[command(about = "Search securities within broker portfolio context")]
@@ -257,6 +313,121 @@ pub struct BrokerHoldingsArgs {
 
     #[arg(long, help = "Optional market data source (for example CONSOLIDATED)")]
     pub quote_source: Option<String>,
+
+    #[arg(long, help = "Print compact JSON")]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct BrokerPortfolioGroupsArgs {
+    #[command(subcommand)]
+    pub command: Option<BrokerPortfolioGroupsCommand>,
+
+    #[arg(long, help = "Portfolio id override")]
+    pub portfolio_id: Option<String>,
+
+    #[arg(long, help = "Broker portfolio group id filter")]
+    pub group_id: Option<String>,
+
+    #[arg(long, help = "Print compact JSON")]
+    pub json: bool,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum BrokerPortfolioGroupsCommand {
+    #[command(about = "Create a broker portfolio group")]
+    Create(BrokerPortfolioGroupsCreateArgs),
+    #[command(about = "Update a broker portfolio group's name or description")]
+    Update(BrokerPortfolioGroupsUpdateArgs),
+    #[command(about = "Delete a broker portfolio group")]
+    Delete(BrokerPortfolioGroupsDeleteArgs),
+    #[command(about = "Assign holdings to a broker portfolio group")]
+    Assign(BrokerPortfolioGroupsAssignArgs),
+    #[command(about = "Unassign holdings from a broker portfolio group")]
+    Unassign(BrokerPortfolioGroupsUnassignArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct BrokerPortfolioGroupsCreateArgs {
+    #[arg(long, help = "Portfolio group name")]
+    pub name: String,
+
+    #[arg(long, help = "Optional portfolio group description")]
+    pub description: Option<String>,
+
+    #[arg(long, help = "Portfolio id override")]
+    pub portfolio_id: Option<String>,
+
+    #[arg(long, help = "Print compact JSON")]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct BrokerPortfolioGroupsUpdateArgs {
+    #[arg(long, help = "Broker portfolio group id")]
+    pub group_id: String,
+
+    #[arg(long, help = "New portfolio group name")]
+    pub name: Option<String>,
+
+    #[arg(
+        long,
+        help = "New portfolio group description",
+        conflicts_with = "clear_description"
+    )]
+    pub description: Option<String>,
+
+    #[arg(
+        long,
+        help = "Clear the portfolio group description",
+        conflicts_with = "description"
+    )]
+    pub clear_description: bool,
+
+    #[arg(long, help = "Portfolio id override")]
+    pub portfolio_id: Option<String>,
+
+    #[arg(long, help = "Print compact JSON")]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct BrokerPortfolioGroupsDeleteArgs {
+    #[arg(long, help = "Broker portfolio group id")]
+    pub group_id: String,
+
+    #[arg(long, help = "Portfolio id override")]
+    pub portfolio_id: Option<String>,
+
+    #[arg(long, help = "Print compact JSON")]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct BrokerPortfolioGroupsAssignArgs {
+    #[arg(long, help = "Broker portfolio group id")]
+    pub group_id: String,
+
+    #[arg(long, required = true, help = "ISIN to assign (repeatable)")]
+    pub isin: Vec<String>,
+
+    #[arg(long, help = "Portfolio id override")]
+    pub portfolio_id: Option<String>,
+
+    #[arg(long, help = "Print compact JSON")]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct BrokerPortfolioGroupsUnassignArgs {
+    #[arg(long, help = "Broker portfolio group id")]
+    pub group_id: String,
+
+    #[arg(long, required = true, help = "ISIN to unassign (repeatable)")]
+    pub isin: Vec<String>,
+
+    #[arg(long, help = "Portfolio id override")]
+    pub portfolio_id: Option<String>,
 
     #[arg(long, help = "Print compact JSON")]
     pub json: bool,
@@ -722,8 +893,10 @@ pub struct BrokerSavingsPlansArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum BrokerSavingsPlansCommand {
-    #[command(about = "Create or update a broker savings plan for a security ISIN")]
+    #[command(about = "Preview or confirm a broker savings plan for a security ISIN")]
     Add(BrokerSavingsPlanAddArgs),
+    #[command(about = "Get broker savings-plan configuration options for a security ISIN")]
+    Config(BrokerSavingsPlanConfigArgs),
     #[command(about = "Remove a broker savings plan for a security ISIN")]
     Remove(BrokerSavingsPlanRemoveArgs),
 }
@@ -801,12 +974,31 @@ pub struct BrokerSavingsPlanAddArgs {
     )]
     pub acknowledged_appropriateness_warning_version: Option<String>,
 
+    #[arg(
+        long,
+        value_parser = non_empty_trimmed_value,
+        help = "Confirmation id from a prior savings-plan preview"
+    )]
+    pub confirm: Option<String>,
+
     #[arg(long, help = "Print compact JSON")]
     pub json: bool,
 }
 
 #[derive(Debug, Args)]
 pub struct BrokerSavingsPlanRemoveArgs {
+    #[arg(long, help = "Portfolio id override")]
+    pub portfolio_id: Option<String>,
+
+    #[arg(long, help = "Security ISIN")]
+    pub isin: String,
+
+    #[arg(long, help = "Print compact JSON")]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct BrokerSavingsPlanConfigArgs {
     #[arg(long, help = "Portfolio id override")]
     pub portfolio_id: Option<String>,
 
@@ -850,9 +1042,15 @@ pub struct BrokerTradeBuyArgs {
 
     #[arg(
         long,
-        help = "Intended order amount in account currency (positive decimal, required for phase 1 and phase 2)"
+        help = "Intended order amount in account currency (positive decimal, mutually exclusive with --shares)"
     )]
     pub amount: Option<String>,
+
+    #[arg(
+        long,
+        help = "Shares to buy (positive whole number, mutually exclusive with --amount)"
+    )]
+    pub shares: Option<String>,
 
     #[arg(long, value_enum, default_value_t = BrokerTradeOrderType::Market, help = "Order type")]
     pub order_type: BrokerTradeOrderType,
@@ -1025,6 +1223,7 @@ mod tests {
             Commands::Overnight(OvernightArgs {
                 savings_account_id,
                 json,
+                ..
             }) => {
                 assert_eq!(savings_account_id.as_deref(), Some("sav-1"));
                 assert!(!json);
@@ -1040,11 +1239,53 @@ mod tests {
             Commands::Overnight(OvernightArgs {
                 savings_account_id,
                 json,
+                ..
             }) => {
                 assert_eq!(savings_account_id.as_deref(), Some("sav-1"));
                 assert!(json);
             }
             _ => panic!("overnight --json should parse"),
+        }
+    }
+
+    #[test]
+    fn overnight_transactions_parses() {
+        let cli = Cli::parse_from([
+            "sc",
+            "overnight",
+            "transactions",
+            "--savings-account-id",
+            "sav-1",
+            "--page-size",
+            "50",
+            "--cursor",
+            "cursor-1",
+            "--type-filter",
+            "deposit",
+            "--search-term",
+            "interest",
+            "--from-time",
+            "2026-03-01T00:00:00Z",
+            "--to-time",
+            "2026-03-02T00:00:00Z",
+            "--json",
+        ]);
+
+        match cli.command {
+            Commands::Overnight(OvernightArgs {
+                command: Some(OvernightCommand::Transactions(args)),
+                ..
+            }) => {
+                assert_eq!(args.savings_account_id.as_deref(), Some("sav-1"));
+                assert_eq!(args.page_size, 50);
+                assert_eq!(args.cursor.as_deref(), Some("cursor-1"));
+                assert_eq!(args.type_filter, vec!["deposit"]);
+                assert_eq!(args.search_term.as_deref(), Some("interest"));
+                assert_eq!(args.from_time.as_deref(), Some("2026-03-01T00:00:00Z"));
+                assert_eq!(args.to_time.as_deref(), Some("2026-03-02T00:00:00Z"));
+                assert!(args.json);
+            }
+            _ => panic!("overnight transactions should parse"),
         }
     }
 
@@ -1237,6 +1478,157 @@ mod tests {
             }
             _ => panic!("broker watchlist should parse"),
         }
+    }
+
+    #[test]
+    fn broker_portfolio_groups_parses() {
+        let cli = Cli::parse_from([
+            "sc",
+            "broker",
+            "portfolio-groups",
+            "--portfolio-id",
+            "p1",
+            "--json",
+        ]);
+        match cli.command {
+            Commands::Broker(BrokerArgs {
+                command: BrokerCommand::PortfolioGroups(args),
+            }) => {
+                assert!(args.command.is_none());
+                assert_eq!(args.portfolio_id.as_deref(), Some("p1"));
+                assert_eq!(args.group_id, None);
+                assert!(args.json);
+            }
+            _ => panic!("broker portfolio-groups should parse"),
+        }
+    }
+
+    #[test]
+    fn broker_portfolio_groups_with_group_id_parses() {
+        let cli = Cli::parse_from([
+            "sc",
+            "broker",
+            "portfolio-groups",
+            "--portfolio-id",
+            "p1",
+            "--group-id",
+            "group-1",
+            "--json",
+        ]);
+        match cli.command {
+            Commands::Broker(BrokerArgs {
+                command: BrokerCommand::PortfolioGroups(args),
+            }) => {
+                assert!(args.command.is_none());
+                assert_eq!(args.portfolio_id.as_deref(), Some("p1"));
+                assert_eq!(args.group_id.as_deref(), Some("group-1"));
+                assert!(args.json);
+            }
+            _ => panic!("broker portfolio-groups with group-id should parse"),
+        }
+    }
+
+    #[test]
+    fn broker_portfolio_groups_lifecycle_commands_parse() {
+        let create = Cli::parse_from([
+            "sc",
+            "broker",
+            "portfolio-groups",
+            "create",
+            "--name",
+            "AI portfolio",
+            "--description",
+            "tracked by agent",
+        ]);
+        let update = Cli::parse_from([
+            "sc",
+            "broker",
+            "portfolio-groups",
+            "update",
+            "--group-id",
+            "group-1",
+            "--clear-description",
+        ]);
+        let delete = Cli::parse_from([
+            "sc",
+            "broker",
+            "portfolio-groups",
+            "delete",
+            "--group-id",
+            "group-1",
+        ]);
+        let assign = Cli::parse_from([
+            "sc",
+            "broker",
+            "portfolio-groups",
+            "assign",
+            "--group-id",
+            "group-1",
+            "--isin",
+            "US0378331005",
+            "--isin",
+            "IE00B4ND3602",
+        ]);
+        let unassign = Cli::parse_from([
+            "sc",
+            "broker",
+            "portfolio-groups",
+            "unassign",
+            "--group-id",
+            "group-1",
+            "--isin",
+            "US0378331005",
+        ]);
+
+        assert!(matches!(
+            create.command,
+            Commands::Broker(BrokerArgs {
+                command: BrokerCommand::PortfolioGroups(BrokerPortfolioGroupsArgs {
+                    command: Some(BrokerPortfolioGroupsCommand::Create(_)),
+                    ..
+                }),
+            })
+        ));
+        assert!(matches!(
+            update.command,
+            Commands::Broker(BrokerArgs {
+                command: BrokerCommand::PortfolioGroups(BrokerPortfolioGroupsArgs {
+                    command: Some(BrokerPortfolioGroupsCommand::Update(_)),
+                    ..
+                }),
+            })
+        ));
+        assert!(matches!(
+            delete.command,
+            Commands::Broker(BrokerArgs {
+                command: BrokerCommand::PortfolioGroups(BrokerPortfolioGroupsArgs {
+                    command: Some(BrokerPortfolioGroupsCommand::Delete(_)),
+                    ..
+                }),
+            })
+        ));
+        match assign.command {
+            Commands::Broker(BrokerArgs {
+                command:
+                    BrokerCommand::PortfolioGroups(BrokerPortfolioGroupsArgs {
+                        command: Some(BrokerPortfolioGroupsCommand::Assign(args)),
+                        ..
+                    }),
+            }) => {
+                assert_eq!(args.group_id, "group-1");
+                assert_eq!(args.isin, ["US0378331005", "IE00B4ND3602"]);
+            }
+            _ => panic!("broker portfolio-groups assign should parse"),
+        }
+        assert!(matches!(
+            unassign.command,
+            Commands::Broker(BrokerArgs {
+                command: BrokerCommand::PortfolioGroups(BrokerPortfolioGroupsArgs {
+                    command: Some(BrokerPortfolioGroupsCommand::Unassign(_)),
+                    ..
+                }),
+            })
+        ));
     }
 
     #[test]
@@ -1559,6 +1951,49 @@ mod tests {
     }
 
     #[test]
+    fn broker_savings_plans_add_confirm_parses_and_rejects_blank_value() {
+        let cli = Cli::parse_from([
+            "sc",
+            "broker",
+            "savings-plans",
+            "add",
+            "--isin",
+            "US0378331005",
+            "--amount",
+            "100",
+            "--confirm",
+            "scsp1_example",
+        ]);
+        match cli.command {
+            Commands::Broker(BrokerArgs {
+                command: BrokerCommand::SavingsPlans(args),
+            }) => match args.command {
+                Some(BrokerSavingsPlansCommand::Add(add_args)) => {
+                    assert_eq!(add_args.confirm.as_deref(), Some("scsp1_example"));
+                }
+                _ => panic!("expected add command"),
+            },
+            _ => panic!("expected savings plans command"),
+        }
+
+        assert!(
+            Cli::try_parse_from([
+                "sc",
+                "broker",
+                "savings-plans",
+                "add",
+                "--isin",
+                "US0378331005",
+                "--amount",
+                "100",
+                "--confirm",
+                "   ",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
     fn broker_savings_plans_remove_parses() {
         let cli = Cli::parse_from([
             "sc",
@@ -1587,6 +2022,34 @@ mod tests {
     }
 
     #[test]
+    fn broker_savings_plans_config_parses() {
+        let cli = Cli::parse_from([
+            "sc",
+            "broker",
+            "savings-plans",
+            "config",
+            "--portfolio-id",
+            "p1",
+            "--isin",
+            "US0378331005",
+            "--json",
+        ]);
+        match cli.command {
+            Commands::Broker(BrokerArgs {
+                command: BrokerCommand::SavingsPlans(args),
+            }) => match args.command {
+                Some(BrokerSavingsPlansCommand::Config(config_args)) => {
+                    assert_eq!(config_args.portfolio_id.as_deref(), Some("p1"));
+                    assert_eq!(config_args.isin, "US0378331005");
+                    assert!(config_args.json);
+                }
+                _ => panic!("expected config subcommand"),
+            },
+            _ => panic!("broker savings-plans config should parse"),
+        }
+    }
+
+    #[test]
     fn broker_trade_buy_parses() {
         let cli = Cli::parse_from([
             "sc",
@@ -1611,6 +2074,7 @@ mod tests {
             }) => {
                 assert_eq!(args.isin.as_deref(), Some("US0378331005"));
                 assert_eq!(args.amount.as_deref(), Some("500"));
+                assert_eq!(args.shares, None);
                 assert_eq!(args.venue.as_deref(), Some("MUNC"));
                 assert_eq!(args.order_type, BrokerTradeOrderType::Market);
                 assert_eq!(args.limit_price, None);
@@ -1650,6 +2114,43 @@ mod tests {
                 assert_eq!(args.stop_price, None);
             }
             _ => panic!("broker trade buy limit should parse"),
+        }
+    }
+
+    #[test]
+    fn broker_trade_buy_shares_parses() {
+        let cli = Cli::parse_from([
+            "sc",
+            "broker",
+            "trade",
+            "buy",
+            "--isin",
+            "US0378331005",
+            "--shares",
+            "3",
+            "--order-type",
+            "market",
+            "--venue",
+            "MUNC",
+        ]);
+        match cli.command {
+            Commands::Broker(BrokerArgs {
+                command:
+                    BrokerCommand::Trade(BrokerTradeArgs {
+                        command: BrokerTradeCommand::Buy(args),
+                    }),
+            }) => {
+                assert_eq!(args.isin.as_deref(), Some("US0378331005"));
+                assert_eq!(args.amount, None);
+                assert_eq!(args.shares.as_deref(), Some("3"));
+                assert_eq!(args.venue.as_deref(), Some("MUNC"));
+                assert_eq!(args.order_type, BrokerTradeOrderType::Market);
+                assert_eq!(args.limit_price, None);
+                assert_eq!(args.stop_price, None);
+                assert_eq!(args.confirm, None);
+                assert!(!args.accept_unsuitable);
+            }
+            _ => panic!("broker trade buy shares should parse"),
         }
     }
 
@@ -1711,6 +2212,7 @@ mod tests {
                 assert_eq!(args.confirm.as_deref(), Some("scb1_deadbeef"));
                 assert_eq!(args.isin.as_deref(), Some("US0378331005"));
                 assert_eq!(args.amount.as_deref(), Some("500"));
+                assert_eq!(args.shares, None);
                 assert_eq!(args.venue.as_deref(), Some("MUNC"));
                 assert!(args.accept_unsuitable);
             }

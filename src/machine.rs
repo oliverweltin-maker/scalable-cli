@@ -1,16 +1,30 @@
 use anyhow::Error;
+use clap::error::{Error as ClapError, ErrorKind};
 use serde::Serialize;
 use serde_json::Value;
 use std::borrow::Cow;
 
 use crate::auth::REFRESH_RELOGIN_REQUIRED_PREFIX;
-use crate::dpop::DPOP_SESSION_KEY_RELOGIN_MESSAGE;
+use crate::broker_shared::{
+    BROKER_PORTFOLIO_GROUP_ALREADY_EXISTS_ERROR_PREFIX,
+    BROKER_PORTFOLIO_GROUP_CANNOT_BE_REMOVED_ERROR_PREFIX,
+    BROKER_PORTFOLIO_GROUP_INVALID_CHARACTERS_ERROR_PREFIX,
+    BROKER_PORTFOLIO_GROUP_NOT_FOUND_ERROR_PREFIX,
+    BROKER_PORTFOLIO_GROUPS_LIMIT_REACHED_ERROR_PREFIX,
+    BROKER_PORTFOLIO_GROUPS_QUOTA_EXCEEDED_ERROR_PREFIX,
+};
+use crate::dpop::{DPOP_SESSION_KEY_RELOGIN_MESSAGE, SecureEnclaveKeyLocked};
 use crate::graphql::{BROKER_TRANSACTION_NOT_FOUND_ERROR_PREFIX, LOCAL_READ_ONLY_ERROR_PREFIX};
 use crate::session::SessionStorageError;
 use crate::trade_controls::{
     LOCAL_TRADE_CONTROL_ISIN_DENIED_PREFIX, LOCAL_TRADE_CONTROL_ISIN_NOT_ALLOWED_PREFIX,
     LOCAL_TRADE_CONTROL_ORDER_NOTIONAL_EXCEEDED_PREFIX,
 };
+
+const DEVICE_LOCKED_ERROR_CODE: &str = "device_locked";
+const DEVICE_LOCKED_ERROR_MESSAGE: &str = "The Mac is locked, so the Secure Enclave signing key cannot be used. Unlock the Mac and retry.";
+const DEVICE_LOCKED_ERROR_HINT: &str =
+    "If the Mac is already unlocked, check Secure Enclave and keychain access.";
 
 #[derive(Debug, Serialize)]
 struct MachineEnvelope {
@@ -53,21 +67,46 @@ pub fn print_success(command: &str, data: Value) {
 
 pub fn print_error(command: &str, err: &Error) -> i32 {
     let classified = classify_error(err);
-    let envelope = MachineEnvelope {
-        ok: false,
-        command: command.to_string(),
-        data: None,
-        error: Some(MachineError {
-            code: classified.code.to_string(),
-            message: concise_error_message(&user_error_message(err)),
-        }),
-        hints: classified.hints.clone(),
-    };
+    print_classified_error(command, &user_error_message(err), &classified)
+}
+
+pub fn print_clap_error(command: &str, err: &ClapError) -> i32 {
+    let classified = classify_clap_error(err);
+    print_classified_error(command, &err.to_string(), &classified)
+}
+
+fn print_classified_error(command: &str, message: &str, classified: &ClassifiedError) -> i32 {
+    let envelope = classified_error_envelope(command, message, classified);
     println!(
         "{}",
         serde_json::to_string(&envelope).expect("Machine envelope should serialize")
     );
     classified.exit_code
+}
+
+fn classified_error_envelope(
+    command: &str,
+    message: &str,
+    classified: &ClassifiedError,
+) -> MachineEnvelope {
+    MachineEnvelope {
+        ok: false,
+        command: command.to_string(),
+        data: None,
+        error: Some(MachineError {
+            code: classified.code.to_string(),
+            message: machine_error_message(message, classified),
+        }),
+        hints: classified.hints.clone(),
+    }
+}
+
+fn machine_error_message(message: &str, classified: &ClassifiedError) -> String {
+    if classified.code == DEVICE_LOCKED_ERROR_CODE {
+        return DEVICE_LOCKED_ERROR_MESSAGE.to_string();
+    }
+
+    concise_error_message(message)
 }
 
 pub fn user_error_message(err: &Error) -> String {
@@ -117,6 +156,46 @@ fn sanitize_error_message(message: &str) -> Cow<'_, str> {
     Cow::Owned(sanitized)
 }
 
+fn looks_like_clap_input_error(lower: &str) -> bool {
+    [
+        "required arguments were not provided",
+        "unexpected argument",
+        "unexpected value",
+        "unrecognized subcommand",
+        "invalid value",
+        "a value is required for",
+        "one of the values isn't valid",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn classify_clap_error(err: &ClapError) -> ClassifiedError {
+    match err.kind() {
+        ErrorKind::ArgumentConflict
+        | ErrorKind::NoEquals
+        | ErrorKind::InvalidValue
+        | ErrorKind::InvalidSubcommand
+        | ErrorKind::MissingRequiredArgument
+        | ErrorKind::MissingSubcommand
+        | ErrorKind::InvalidUtf8
+        | ErrorKind::TooManyValues
+        | ErrorKind::TooFewValues
+        | ErrorKind::ValueValidation
+        | ErrorKind::WrongNumberOfValues
+        | ErrorKind::UnknownArgument => ClassifiedError {
+            code: "invalid_input",
+            exit_code: 10,
+            hints: vec!["Check command arguments and input values.".to_string()],
+        },
+        _ => ClassifiedError {
+            code: "internal_error",
+            exit_code: 1,
+            hints: Vec::new(),
+        },
+    }
+}
+
 pub fn classify_error(err: &Error) -> ClassifiedError {
     if let Some(storage_error) = session_storage_error_in_chain(err) {
         return match storage_error {
@@ -130,12 +209,21 @@ pub fn classify_error(err: &Error) -> ClassifiedError {
         };
     }
 
+    if secure_enclave_key_locked_in_chain(err) {
+        return ClassifiedError {
+            code: DEVICE_LOCKED_ERROR_CODE,
+            exit_code: 20,
+            hints: vec![DEVICE_LOCKED_ERROR_HINT.to_string()],
+        };
+    }
+
     let text = full_error_text(err);
     let lower = text.to_lowercase();
 
     if text.contains("Provide exactly one of --query or --query-file")
         || text.contains("Provide at most one of --variables or --variables-file")
         || text.contains("Token from stdin is empty")
+        || looks_like_clap_input_error(&lower)
     {
         return ClassifiedError {
             code: "invalid_input",
@@ -185,24 +273,6 @@ pub fn classify_error(err: &Error) -> ClassifiedError {
         };
     }
 
-    if lower.contains("broker input invalid:") {
-        return ClassifiedError {
-            code: "broker_input_invalid",
-            exit_code: 10,
-            hints: vec!["Check broker command inputs and retry.".to_string()],
-        };
-    }
-
-    if text.contains(BROKER_TRANSACTION_NOT_FOUND_ERROR_PREFIX) {
-        return ClassifiedError {
-            code: "broker_transaction_not_found",
-            exit_code: 10,
-            hints: vec![
-                "Check the transaction id and selected broker portfolio, then retry.".to_string(),
-            ],
-        };
-    }
-
     if text.contains("SAVINGS_PLAN_INPUT_INVALID:") {
         return ClassifiedError {
             code: "savings_plan_input_invalid",
@@ -222,6 +292,171 @@ pub fn classify_error(err: &Error) -> ClassifiedError {
         };
     }
 
+    if text.contains("SAVINGS_PLAN_EX_ANTE_COST_UNAVAILABLE:") {
+        return ClassifiedError {
+            code: "savings_plan_ex_ante_cost_unavailable",
+            exit_code: 30,
+            hints: vec![
+                "Ex-ante costs are unavailable. Do not submit; rerun phase 1 later.".to_string(),
+            ],
+        };
+    }
+
+    if text.contains("SAVINGS_PLAN_CONFIRMATION_NOT_FOUND:") {
+        return ClassifiedError {
+            code: "savings_plan_confirmation_not_found",
+            exit_code: 10,
+            hints: vec![
+                "Run savings-plan phase 1 again to obtain a new confirmation id.".to_string(),
+            ],
+        };
+    }
+
+    if text.contains("SAVINGS_PLAN_CONFIRMATION_EXPIRED:") {
+        return ClassifiedError {
+            code: "savings_plan_confirmation_expired",
+            exit_code: 10,
+            hints: vec!["Run savings-plan phase 1 again; the confirmation expired.".to_string()],
+        };
+    }
+
+    if text.contains("SAVINGS_PLAN_CONFIRMATION_ALREADY_USED:") {
+        return ClassifiedError {
+            code: "savings_plan_confirmation_already_used",
+            exit_code: 10,
+            hints: vec![
+                "Run a new savings-plan phase 1 preview for a new client instruction.".to_string(),
+            ],
+        };
+    }
+
+    if text.contains("SAVINGS_PLAN_CONFIRMATION_CORRUPT:") {
+        return ClassifiedError {
+            code: "savings_plan_confirmation_corrupt",
+            exit_code: 20,
+            hints: vec![
+                "Do not submit. Clear the corrupt local confirmation state and run phase 1 again."
+                    .to_string(),
+            ],
+        };
+    }
+
+    for (prefix, code) in [
+        (
+            "SAVINGS_PLAN_CONFIRMATION_ENV_MISMATCH:",
+            "savings_plan_confirmation_env_mismatch",
+        ),
+        (
+            "SAVINGS_PLAN_CONFIRMATION_ACCOUNT_MISMATCH:",
+            "savings_plan_confirmation_account_mismatch",
+        ),
+        (
+            "SAVINGS_PLAN_CONFIRMATION_PORTFOLIO_MISMATCH:",
+            "savings_plan_confirmation_portfolio_mismatch",
+        ),
+        (
+            "SAVINGS_PLAN_CONFIRMATION_FIELDS_MISMATCH:",
+            "savings_plan_confirmation_fields_mismatch",
+        ),
+    ] {
+        if text.contains(prefix) {
+            return ClassifiedError {
+                code,
+                exit_code: 10,
+                hints: vec![
+                    "The preview no longer matches. Run savings-plan phase 1 again.".to_string(),
+                ],
+            };
+        }
+    }
+
+    if text.contains("SAVINGS_PLAN_SUBMISSION_FAILED:") {
+        return ClassifiedError {
+            code: "savings_plan_submission_failed",
+            exit_code: 30,
+            hints: vec!["The backend rejected the submission. Run a new phase 1 preview before trying again.".to_string()],
+        };
+    }
+
+    if text.contains("SAVINGS_PLAN_SUBMISSION_UNKNOWN:") {
+        return ClassifiedError {
+            code: "savings_plan_submission_unknown",
+            exit_code: 30,
+            hints: vec!["Do not retry the add command. Inspect `sc broker savings-plans` for the same account and portfolio first.".to_string()],
+        };
+    }
+
+    if lower.contains("broker input invalid:") {
+        return ClassifiedError {
+            code: "broker_input_invalid",
+            exit_code: 10,
+            hints: vec!["Check broker command inputs and retry.".to_string()],
+        };
+    }
+
+    if text.contains(BROKER_TRANSACTION_NOT_FOUND_ERROR_PREFIX) {
+        return ClassifiedError {
+            code: "broker_transaction_not_found",
+            exit_code: 10,
+            hints: vec![
+                "Check the transaction id and selected broker portfolio, then retry.".to_string(),
+            ],
+        };
+    }
+
+    if text.contains(BROKER_PORTFOLIO_GROUP_NOT_FOUND_ERROR_PREFIX) {
+        return ClassifiedError {
+            code: "portfolio_group_not_found",
+            exit_code: 10,
+            hints: vec![
+                "Check the group id and selected broker portfolio, then retry.".to_string(),
+            ],
+        };
+    }
+
+    if text.contains(BROKER_PORTFOLIO_GROUP_INVALID_CHARACTERS_ERROR_PREFIX) {
+        return ClassifiedError {
+            code: "portfolio_group_invalid_characters",
+            exit_code: 10,
+            hints: vec!["Remove the unsupported characters and retry.".to_string()],
+        };
+    }
+
+    if text.contains(BROKER_PORTFOLIO_GROUPS_QUOTA_EXCEEDED_ERROR_PREFIX) {
+        return ClassifiedError {
+            code: "portfolio_groups_quota_exceeded",
+            exit_code: 10,
+            hints: vec![
+                "Upgrade the offer or reduce existing portfolio groups, then retry.".to_string(),
+            ],
+        };
+    }
+
+    if text.contains(BROKER_PORTFOLIO_GROUPS_LIMIT_REACHED_ERROR_PREFIX) {
+        return ClassifiedError {
+            code: "portfolio_groups_limit_reached",
+            exit_code: 10,
+            hints: vec![
+                "The technical maximum number of portfolio groups has been reached.".to_string(),
+            ],
+        };
+    }
+
+    if text.contains(BROKER_PORTFOLIO_GROUP_ALREADY_EXISTS_ERROR_PREFIX) {
+        return ClassifiedError {
+            code: "portfolio_group_already_exists",
+            exit_code: 10,
+            hints: vec!["Choose a different portfolio group name and retry.".to_string()],
+        };
+    }
+
+    if text.contains(BROKER_PORTFOLIO_GROUP_CANNOT_BE_REMOVED_ERROR_PREFIX) {
+        return ClassifiedError {
+            code: "portfolio_group_cannot_be_removed",
+            exit_code: 10,
+            hints: vec!["Remove dependent items or pending activity, then retry.".to_string()],
+        };
+    }
     if lower.contains("broker response invalid:") {
         return ClassifiedError {
             code: "broker_response_invalid",
@@ -592,10 +827,100 @@ fn session_storage_error_in_chain(err: &Error) -> Option<&SessionStorageError> {
         .find_map(|cause| cause.downcast_ref::<SessionStorageError>())
 }
 
+fn secure_enclave_key_locked_in_chain(err: &Error) -> bool {
+    err.downcast_ref::<SecureEnclaveKeyLocked>().is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use anyhow::anyhow;
+
+    fn clap_error(kind: ErrorKind) -> ClapError {
+        ClapError::raw(kind, "parse failed")
+    }
+
+    fn locked_secure_enclave_error() -> Error {
+        crate::dpop::map_secure_enclave_signing_error(-25308, "OSStatus error -25308")
+            .context("Failed generating DPoP proof for GraphQL request")
+    }
+
+    #[test]
+    fn classify_locked_secure_enclave_key_error() {
+        let err = locked_secure_enclave_error();
+
+        let classified = classify_error(&err);
+
+        assert_eq!(classified.code, "device_locked");
+        assert_eq!(classified.exit_code, 20);
+        assert_eq!(
+            classified.hints,
+            vec!["If the Mac is already unlocked, check Secure Enclave and keychain access."]
+        );
+    }
+
+    #[test]
+    fn locked_secure_enclave_key_uses_fixed_machine_envelope_message() {
+        let err = locked_secure_enclave_error();
+        let classified = classify_error(&err);
+        let envelope =
+            classified_error_envelope("broker.quote", &user_error_message(&err), &classified);
+        let value = serde_json::to_value(envelope).expect("serialize machine envelope");
+
+        assert_eq!(value["ok"], false);
+        assert_eq!(value["command"], "broker.quote");
+        assert_eq!(value["error"]["code"], "device_locked");
+        assert_eq!(
+            value["error"]["message"],
+            "The Mac is locked, so the Secure Enclave signing key cannot be used. Unlock the Mac and retry."
+        );
+        assert_eq!(
+            value["hints"],
+            serde_json::json!([
+                "If the Mac is already unlocked, check Secure Enclave and keychain access."
+            ])
+        );
+        assert!(
+            !value["error"]["message"]
+                .as_str()
+                .expect("machine error message")
+                .contains("OSStatus")
+        );
+    }
+
+    #[test]
+    fn generic_osstatus_interaction_not_allowed_text_remains_internal_error() {
+        let err =
+            anyhow!("Failed generating DPoP proof for GraphQL request: OSStatus error -25308");
+
+        let classified = classify_error(&err);
+
+        assert_eq!(classified.code, "internal_error");
+        assert_eq!(classified.exit_code, 1);
+    }
+
+    #[test]
+    fn unmarked_secure_enclave_error_remains_internal_error() {
+        let err = crate::dpop::map_secure_enclave_signing_error(
+            -25309,
+            "native Secure Enclave signing failure",
+        )
+        .context("Failed generating DPoP proof for GraphQL request");
+
+        let classified = classify_error(&err);
+
+        assert_eq!(classified.code, "internal_error");
+        assert_eq!(classified.exit_code, 1);
+    }
+
+    #[test]
+    fn human_error_message_retains_locked_secure_enclave_guidance() {
+        let message = human_error_message(&locked_secure_enclave_error());
+
+        assert!(message.contains(
+            "The Mac is locked, so the Secure Enclave signing key cannot be used. Unlock the Mac and retry."
+        ));
+    }
 
     #[test]
     fn classify_no_session_error() {
@@ -612,6 +937,75 @@ mod tests {
         let c = classify_error(&err);
         assert_eq!(c.code, "broker_context_missing");
         assert_eq!(c.exit_code, 10);
+    }
+
+    #[test]
+    fn portfolio_group_membership_validation_uses_machine_input_error_envelope() {
+        let err = anyhow!(
+            "Broker input invalid: ISINs already assigned to portfolio group 'group-1': [US0378331005]"
+        );
+        let classified = classify_error(&err);
+        let envelope = classified_error_envelope(
+            "broker.portfolio-groups.assign",
+            &user_error_message(&err),
+            &classified,
+        );
+        let value = serde_json::to_value(envelope).expect("serialize machine envelope");
+
+        assert_eq!(value["command"], "broker.portfolio-groups.assign");
+        assert_eq!(value["error"]["code"], "broker_input_invalid");
+        assert_eq!(
+            value["error"]["message"],
+            "Broker input invalid: ISINs already assigned to portfolio group 'group-1': [US0378331005]"
+        );
+    }
+
+    #[test]
+    fn classify_clap_missing_required_argument_error() {
+        let err = anyhow!(
+            "error: the following required arguments were not provided:\n  --portfolio-id <PORTFOLIO_ID>\n\nUsage: sc broker context select --portfolio-id <PORTFOLIO_ID>"
+        );
+        let c = classify_error(&err);
+        assert_eq!(c.code, "invalid_input");
+        assert_eq!(c.exit_code, 10);
+    }
+
+    #[test]
+    fn classify_clap_invalid_subcommand_error() {
+        let err = anyhow!("error: unrecognized subcommand 'bogus'\n\nUsage: sc broker <COMMAND>");
+        let c = classify_error(&err);
+        assert_eq!(c.code, "invalid_input");
+        assert_eq!(c.exit_code, 10);
+    }
+
+    #[test]
+    fn classify_non_clap_subcommand_text_does_not_match_invalid_input() {
+        let err = anyhow!("downstream service reported that the subcommand failed unexpectedly");
+        let c = classify_error(&err);
+        assert_eq!(c.code, "internal_error");
+        assert_eq!(c.exit_code, 1);
+    }
+
+    #[test]
+    fn classify_common_clap_kinds_as_invalid_input() {
+        for kind in [
+            ErrorKind::UnknownArgument,
+            ErrorKind::InvalidValue,
+            ErrorKind::TooManyValues,
+            ErrorKind::TooFewValues,
+            ErrorKind::WrongNumberOfValues,
+            ErrorKind::ArgumentConflict,
+            ErrorKind::NoEquals,
+            ErrorKind::ValueValidation,
+        ] {
+            let classified = classify_clap_error(&clap_error(kind));
+            assert_eq!(classified.code, "invalid_input");
+            assert_eq!(classified.exit_code, 10);
+            assert_eq!(
+                classified.hints,
+                vec!["Check command arguments and input values."]
+            );
+        }
     }
 
     #[test]
@@ -634,6 +1028,51 @@ mod tests {
                 .iter()
                 .any(|hint| hint.contains("selected broker portfolio"))
         );
+    }
+
+    #[test]
+    fn classify_portfolio_group_not_found_error() {
+        let err = anyhow!(
+            "Broker portfolio group not found: portfolio group 'group-1' was not found in the active portfolio"
+        );
+        let c = classify_error(&err);
+        assert_eq!(c.code, "portfolio_group_not_found");
+        assert_eq!(c.exit_code, 10);
+        assert!(
+            c.hints
+                .iter()
+                .any(|hint| hint.contains("selected broker portfolio"))
+        );
+    }
+
+    #[test]
+    fn classify_portfolio_group_lifecycle_validation_errors() {
+        let cases = [
+            (
+                "Broker portfolio group invalid characters: name contains '@'",
+                "portfolio_group_invalid_characters",
+            ),
+            (
+                "Broker portfolio groups quota exceeded: offer does not allow another group",
+                "portfolio_groups_quota_exceeded",
+            ),
+            (
+                "Broker portfolio groups limit reached: technical maximum reached",
+                "portfolio_groups_limit_reached",
+            ),
+            (
+                "Broker portfolio group already exists: Group already exists",
+                "portfolio_group_already_exists",
+            ),
+            (
+                "Broker portfolio group cannot be removed: The portfolio group cannot be removed",
+                "portfolio_group_cannot_be_removed",
+            ),
+        ];
+
+        for (message, code) in cases {
+            assert_eq!(classify_error(&anyhow!(message)).code, code);
+        }
     }
 
     #[test]
@@ -762,11 +1201,86 @@ mod tests {
     }
 
     #[test]
+    fn classify_wrapped_savings_plan_input_invalid_error() {
+        let err = anyhow!(
+            "SAVINGS_PLAN_INPUT_INVALID: Broker input invalid: field 'isin' must be a valid ISIN"
+        );
+        let c = classify_error(&err);
+        assert_eq!(c.code, "savings_plan_input_invalid");
+        assert_eq!(c.exit_code, 10);
+    }
+
+    #[test]
     fn classify_savings_plan_config_unavailable_error() {
         let err = anyhow!("SAVINGS_PLAN_CONFIG_UNAVAILABLE: missing schedules in config");
         let c = classify_error(&err);
         assert_eq!(c.code, "savings_plan_config_unavailable");
         assert_eq!(c.exit_code, 10);
+    }
+
+    #[test]
+    fn classify_new_savings_plan_confirmation_errors() {
+        for (message, code, exit_code) in [
+            (
+                "SAVINGS_PLAN_EX_ANTE_COST_UNAVAILABLE: missing total",
+                "savings_plan_ex_ante_cost_unavailable",
+                30,
+            ),
+            (
+                "SAVINGS_PLAN_CONFIRMATION_NOT_FOUND: missing",
+                "savings_plan_confirmation_not_found",
+                10,
+            ),
+            (
+                "SAVINGS_PLAN_CONFIRMATION_EXPIRED: expired",
+                "savings_plan_confirmation_expired",
+                10,
+            ),
+            (
+                "SAVINGS_PLAN_CONFIRMATION_ALREADY_USED: consumed",
+                "savings_plan_confirmation_already_used",
+                10,
+            ),
+            (
+                "SAVINGS_PLAN_CONFIRMATION_CORRUPT: invalid JSON",
+                "savings_plan_confirmation_corrupt",
+                20,
+            ),
+            (
+                "SAVINGS_PLAN_CONFIRMATION_ENV_MISMATCH: wrong env",
+                "savings_plan_confirmation_env_mismatch",
+                10,
+            ),
+            (
+                "SAVINGS_PLAN_CONFIRMATION_ACCOUNT_MISMATCH: wrong account",
+                "savings_plan_confirmation_account_mismatch",
+                10,
+            ),
+            (
+                "SAVINGS_PLAN_CONFIRMATION_PORTFOLIO_MISMATCH: wrong portfolio",
+                "savings_plan_confirmation_portfolio_mismatch",
+                10,
+            ),
+            (
+                "SAVINGS_PLAN_CONFIRMATION_FIELDS_MISMATCH: costs changed",
+                "savings_plan_confirmation_fields_mismatch",
+                10,
+            ),
+            (
+                "SAVINGS_PLAN_SUBMISSION_FAILED: backend rejected",
+                "savings_plan_submission_failed",
+                30,
+            ),
+            (
+                "SAVINGS_PLAN_SUBMISSION_UNKNOWN: timeout",
+                "savings_plan_submission_unknown",
+                30,
+            ),
+        ] {
+            let classified = classify_error(&anyhow!(message));
+            assert_eq!(classified.code, code, "{message}");
+            assert_eq!(classified.exit_code, exit_code, "{message}");
+        }
     }
 
     #[test]

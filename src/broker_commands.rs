@@ -1,10 +1,20 @@
 use anyhow::{Result, anyhow, bail};
+use clap::ValueEnum;
 use serde_json::{Value, json};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::active_session::load_active_session;
 use crate::broker_context::{
     BrokerContext, context_file_path, load_context as load_broker_context,
     save_context as save_broker_context,
+};
+use crate::broker_portfolio_groups::{
+    execute_broker_portfolio_groups, execute_broker_portfolio_groups_assign,
+    execute_broker_portfolio_groups_create, execute_broker_portfolio_groups_delete,
+    execute_broker_portfolio_groups_unassign, execute_broker_portfolio_groups_update,
+};
+use crate::broker_portfolio_groups_render::{
+    render_broker_portfolio_groups_mutation_text, render_broker_portfolio_groups_text,
 };
 use crate::broker_query_execution::{
     execute_broker_analytics as execute_broker_analytics_query,
@@ -22,14 +32,16 @@ use crate::broker_query_execution::{
     execute_broker_transactions as execute_broker_transactions_query,
     execute_broker_watchlist as execute_broker_watchlist_query,
 };
-use crate::broker_shared::{RESOLVE_BROKER_IDS_QUERY, resolve_broker_ids, validated_broker_input};
+use crate::broker_shared::{
+    RESOLVE_BROKER_IDS_QUERY, ResolvedBrokerIds, resolve_broker_ids, validated_broker_input,
+};
 use crate::cli::{
     BrokerArgs, BrokerCommand, BrokerContextCommand, BrokerDerivativesCommand,
-    BrokerPriceAlertsCommand, BrokerSavingsPlansCommand, BrokerTradeCommand,
-    BrokerTransactionCommand, BrokerWatchlistCommand,
+    BrokerPortfolioGroupsCommand, BrokerPriceAlertsCommand, BrokerSavingsPlansCommand,
+    BrokerTradeCommand, BrokerTransactionCommand, BrokerWatchlistCommand,
 };
 use crate::config::{AppConfig, EnvConfig, TargetEnv};
-use crate::graphql::execute_graphql;
+use crate::graphql::{enforce_graphql_access_policy, execute_graphql, execute_graphql_once};
 use crate::helpers::{
     BROKER_ADD_CRYPTO_PRICE_ALERT_MUTATION, BROKER_ADD_PRICE_ALERT_MUTATION,
     BROKER_ADD_TO_WATCHLIST_MUTATION, BROKER_CREATE_OR_UPDATE_SAVINGS_PLAN_MUTATION,
@@ -37,19 +49,34 @@ use crate::helpers::{
     BROKER_REMOVE_CRYPTO_PRICE_ALERT_MUTATION, BROKER_REMOVE_FROM_WATCHLIST_MUTATION,
     BROKER_REMOVE_PRICE_ALERT_MUTATION, BROKER_REMOVE_SAVINGS_PLAN_MUTATION,
     BROKER_SAVINGS_PLAN_BY_ISIN_QUERY, BROKER_SAVINGS_PLAN_CONFIG_QUERY,
-    broker_add_crypto_price_alert_variables, broker_add_price_alert_variables,
-    broker_add_to_watchlist_variables, broker_create_or_update_savings_plan_variables,
-    broker_crypto_price_alerts_variables, broker_remove_from_watchlist_variables,
-    broker_remove_price_alert_variables, broker_remove_savings_plan_variables,
-    broker_savings_plan_by_isin_variables, broker_savings_plan_config_variables,
+    BROKER_SAVINGS_PLAN_EX_ANTE_COSTS_QUERY, broker_add_crypto_price_alert_variables,
+    broker_add_price_alert_variables, broker_add_to_watchlist_variables,
+    broker_create_or_update_savings_plan_variables, broker_crypto_price_alerts_variables,
+    broker_remove_from_watchlist_variables, broker_remove_price_alert_variables,
+    broker_remove_savings_plan_variables, broker_savings_plan_by_isin_variables,
+    broker_savings_plan_config_variables, broker_savings_plan_ex_ante_cost_variables,
     project_broker_add_crypto_price_alert_response, project_broker_add_price_alert_response,
     project_broker_create_or_update_savings_plan_response,
     project_broker_crypto_price_alerts_response, project_broker_remove_crypto_price_alert_response,
     project_broker_remove_price_alert_response, project_broker_remove_savings_plan_response,
-    project_broker_savings_plan_by_isin_response, project_broker_savings_plan_config_response,
-    project_broker_watchlist_add_response, project_broker_watchlist_remove_response,
+    project_broker_savings_plan_by_isin_response,
+    project_broker_savings_plan_config_details_response,
+    project_broker_savings_plan_ex_ante_costs_response, project_broker_watchlist_add_response,
+    project_broker_watchlist_remove_response,
 };
+use crate::payload_fingerprint::checksum_for_payload;
 use crate::resolve_active_env;
+use crate::savings_plan_confirmation::{
+    SavingsPlanConfirmation, assert_preview_allowed, finalize_consumed, finalize_unknown,
+    load_pending as load_savings_plan_confirmation, start_submission, store_pending,
+};
+use crate::savings_plan_presentation::{
+    COMPLIANCE_RULE_ID as SAVINGS_PLAN_COMPLIANCE_RULE_ID,
+    PRESENTATION_FORMAT as SAVINGS_PLAN_PRESENTATION_FORMAT,
+    build_phase1_presentation as build_savings_plan_presentation,
+    render_phase1_text as render_savings_plan_preview_text,
+    required_leaf_paths as savings_plan_required_leaf_paths,
+};
 use crate::session::{Session, SessionManager};
 use crate::session_refresh::execute_with_refresh_retry;
 use crate::trade_execution::{
@@ -270,6 +297,84 @@ pub(crate) fn run_broker_command_human(
             let payload = execute_broker_holdings(holdings_args, config, session_manager)?;
             Ok(HumanBrokerOutput::Json(payload, compact))
         }
+        BrokerCommand::PortfolioGroups(portfolio_groups_args) => {
+            let crate::cli::BrokerPortfolioGroupsArgs {
+                command,
+                portfolio_id,
+                group_id,
+                json,
+            } = portfolio_groups_args;
+            match command {
+                Some(BrokerPortfolioGroupsCommand::Create(create_args)) => {
+                    let payload = execute_broker_portfolio_groups_create(
+                        create_args,
+                        config,
+                        session_manager,
+                    )?;
+                    Ok(HumanBrokerOutput::Text(
+                        render_broker_portfolio_groups_mutation_text(&payload),
+                    ))
+                }
+                Some(BrokerPortfolioGroupsCommand::Update(update_args)) => {
+                    let payload = execute_broker_portfolio_groups_update(
+                        update_args,
+                        config,
+                        session_manager,
+                    )?;
+                    Ok(HumanBrokerOutput::Text(
+                        render_broker_portfolio_groups_mutation_text(&payload),
+                    ))
+                }
+                Some(BrokerPortfolioGroupsCommand::Delete(delete_args)) => {
+                    let payload = execute_broker_portfolio_groups_delete(
+                        delete_args,
+                        config,
+                        session_manager,
+                    )?;
+                    Ok(HumanBrokerOutput::Text(
+                        render_broker_portfolio_groups_mutation_text(&payload),
+                    ))
+                }
+                Some(BrokerPortfolioGroupsCommand::Assign(assign_args)) => {
+                    let payload = execute_broker_portfolio_groups_assign(
+                        assign_args,
+                        config,
+                        session_manager,
+                    )?;
+                    Ok(HumanBrokerOutput::Text(
+                        render_broker_portfolio_groups_mutation_text(&payload),
+                    ))
+                }
+                Some(BrokerPortfolioGroupsCommand::Unassign(unassign_args)) => {
+                    let payload = execute_broker_portfolio_groups_unassign(
+                        unassign_args,
+                        config,
+                        session_manager,
+                    )?;
+                    Ok(HumanBrokerOutput::Text(
+                        render_broker_portfolio_groups_mutation_text(&payload),
+                    ))
+                }
+                None => {
+                    let filtered_to_group = group_id
+                        .as_deref()
+                        .is_some_and(|value| !value.trim().is_empty());
+                    let payload = execute_broker_portfolio_groups(
+                        crate::cli::BrokerPortfolioGroupsArgs {
+                            command: None,
+                            portfolio_id,
+                            group_id,
+                            json,
+                        },
+                        config,
+                        session_manager,
+                    )?;
+                    Ok(HumanBrokerOutput::Text(
+                        render_broker_portfolio_groups_text(&payload, filtered_to_group),
+                    ))
+                }
+            }
+        }
         BrokerCommand::Watchlist(watchlist_args) => {
             let crate::cli::BrokerWatchlistArgs {
                 command,
@@ -381,10 +486,28 @@ pub(crate) fn run_broker_command_human(
             } = savings_plans_args;
             match command {
                 Some(BrokerSavingsPlansCommand::Add(add_args)) => {
-                    let compact = add_args.json;
+                    let is_preview = add_args.confirm.is_none();
                     let payload =
                         execute_broker_savings_plan_add(add_args, config, session_manager)?;
-                    Ok(HumanBrokerOutput::Json(payload, compact))
+                    if is_preview {
+                        Ok(HumanBrokerOutput::Text(render_savings_plan_preview_text(
+                            &payload,
+                        )))
+                    } else {
+                        Ok(HumanBrokerOutput::Json(payload, false))
+                    }
+                }
+                Some(BrokerSavingsPlansCommand::Config(config_args)) => {
+                    let compact = config_args.json;
+                    let payload =
+                        execute_broker_savings_plan_config(config_args, config, session_manager)?;
+                    if compact {
+                        Ok(HumanBrokerOutput::Json(payload, true))
+                    } else {
+                        Ok(HumanBrokerOutput::Text(
+                            render_broker_savings_plan_config_text(&payload),
+                        ))
+                    }
                 }
                 Some(BrokerSavingsPlansCommand::Remove(remove_args)) => {
                     let compact = remove_args.json;
@@ -485,6 +608,41 @@ pub(crate) fn run_broker_command_machine(
             }
         },
         BrokerCommand::Holdings(args) => execute_broker_holdings(args, config, session_manager),
+        BrokerCommand::PortfolioGroups(args) => {
+            let crate::cli::BrokerPortfolioGroupsArgs {
+                command,
+                portfolio_id,
+                group_id,
+                json,
+            } = args;
+            match command {
+                Some(BrokerPortfolioGroupsCommand::Create(args)) => {
+                    execute_broker_portfolio_groups_create(args, config, session_manager)
+                }
+                Some(BrokerPortfolioGroupsCommand::Update(args)) => {
+                    execute_broker_portfolio_groups_update(args, config, session_manager)
+                }
+                Some(BrokerPortfolioGroupsCommand::Delete(args)) => {
+                    execute_broker_portfolio_groups_delete(args, config, session_manager)
+                }
+                Some(BrokerPortfolioGroupsCommand::Assign(args)) => {
+                    execute_broker_portfolio_groups_assign(args, config, session_manager)
+                }
+                Some(BrokerPortfolioGroupsCommand::Unassign(args)) => {
+                    execute_broker_portfolio_groups_unassign(args, config, session_manager)
+                }
+                None => execute_broker_portfolio_groups(
+                    crate::cli::BrokerPortfolioGroupsArgs {
+                        command: None,
+                        portfolio_id,
+                        group_id,
+                        json,
+                    },
+                    config,
+                    session_manager,
+                ),
+            }
+        }
         BrokerCommand::Watchlist(args) => {
             let crate::cli::BrokerWatchlistArgs {
                 command,
@@ -559,6 +717,9 @@ pub(crate) fn run_broker_command_machine(
             match command {
                 Some(BrokerSavingsPlansCommand::Add(add_args)) => {
                     execute_broker_savings_plan_add(add_args, config, session_manager)
+                }
+                Some(BrokerSavingsPlansCommand::Config(config_args)) => {
+                    execute_broker_savings_plan_config(config_args, config, session_manager)
                 }
                 Some(BrokerSavingsPlansCommand::Remove(remove_args)) => {
                     execute_broker_savings_plan_remove(remove_args, config, session_manager)
@@ -666,6 +827,81 @@ fn render_broker_cash_breakdown_text(payload: &Value) -> Vec<String> {
             display_value(result.get("available_for_derivatives"))
         ),
     ]
+}
+
+fn render_broker_savings_plan_config_text(payload: &Value) -> Vec<String> {
+    let result = payload.get("result").unwrap_or(payload);
+    let security = result.get("security").unwrap_or(&Value::Null);
+    let amount_limits = result.get("amount_limits").unwrap_or(&Value::Null);
+    let defaults = result.get("defaults").unwrap_or(&Value::Null);
+    let schedules = result
+        .get("schedules")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+
+    let mut lines = vec![
+        format!(
+            "portfolio_id: {}",
+            display_value(payload.get("portfolio_id"))
+        ),
+        format!("security_isin: {}", display_value(security.get("isin"))),
+        format!("security_name: {}", display_value(security.get("name"))),
+        format!(
+            "security_type: {}",
+            display_value(security.get("security_type"))
+        ),
+        format!("amount_min: {}", display_value(amount_limits.get("min"))),
+        format!("amount_max: {}", display_value(amount_limits.get("max"))),
+        format!(
+            "default_frequency: {}",
+            display_value(defaults.get("frequency"))
+        ),
+        format!(
+            "default_day_of_month: {}",
+            display_value(defaults.get("day_of_month"))
+        ),
+        format!(
+            "default_year_month: {}",
+            display_value(defaults.get("year_month"))
+        ),
+        format!(
+            "default_dynamization_rate: {}",
+            display_value(defaults.get("dynamization_rate"))
+        ),
+        format!(
+            "default_payment_method: {}",
+            display_value(defaults.get("payment_method"))
+        ),
+        format!(
+            "frequencies: {}",
+            display_string_list(result.get("frequencies"))
+        ),
+        format!(
+            "payment_methods: {}",
+            display_string_list(result.get("payment_methods"))
+        ),
+        format!(
+            "dynamization_rates: {}",
+            display_string_list(result.get("dynamization_rates"))
+        ),
+    ];
+
+    for schedule in schedules {
+        let day_of_month = schedule
+            .get("day_of_month")
+            .map(|value| display_value(Some(value)))
+            .unwrap_or_else(|| "<none>".to_string());
+        lines.push(format!(
+            "schedule_{day_of_month}: day_of_month={} default={} earliest={} available_year_months={}",
+            display_value(schedule.get("day_of_month")),
+            display_value(schedule.get("is_default")),
+            display_value(schedule.get("is_earliest")),
+            display_string_list(schedule.get("available_year_months")),
+        ));
+    }
+
+    lines
 }
 
 fn render_broker_transaction_details_text(payload: &Value) -> Vec<String> {
@@ -1011,6 +1247,24 @@ fn display_value(value: Option<&Value>) -> String {
         Value::Bool(raw) => raw.to_string(),
         Value::String(raw) => raw.clone(),
         other => other.to_string(),
+    }
+}
+
+fn display_string_list(value: Option<&Value>) -> String {
+    let values = value
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|item| !item.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if values.is_empty() {
+        "<none>".to_string()
+    } else {
+        values.join(", ")
     }
 }
 
@@ -1687,11 +1941,30 @@ pub(crate) fn execute_broker_savings_plans(
     execute_broker_savings_plans_query(args, config, session_manager)
 }
 
-pub(crate) fn execute_broker_savings_plan_add(
-    args: crate::cli::BrokerSavingsPlanAddArgs,
+struct LoadedBrokerSavingsPlanConfig {
+    ids: ResolvedBrokerIds,
+    requested_isin: String,
+    response: Value,
+}
+
+fn broker_result_envelope(ids: &ResolvedBrokerIds, result: Value) -> Value {
+    json!({
+        "account_id": ids.account_id,
+        "portfolio_id": ids.portfolio_id,
+        "resolution": {
+            "account": ids.account_source,
+            "portfolio": ids.portfolio_source,
+        },
+        "result": result,
+    })
+}
+
+fn load_broker_savings_plan_config_response(
     config: &AppConfig,
     session_manager: &mut SessionManager,
-) -> Result<Value> {
+    portfolio_id: Option<&str>,
+    isin: &str,
+) -> Result<LoadedBrokerSavingsPlanConfig> {
     let dpop_options = crate::channel::current_dpop_runtime_options(config);
     let dpop_options = &dpop_options;
     let env = resolve_active_env(session_manager)?;
@@ -1700,31 +1973,56 @@ pub(crate) fn execute_broker_savings_plan_add(
     let mut session = loaded.session;
     let access_context = loaded.access_context;
 
-    let isin = args.isin.trim().to_string();
-    if isin.is_empty() {
+    load_broker_savings_plan_config_response_with_session(
+        session_manager,
+        env,
+        &env_cfg,
+        &mut session,
+        access_context,
+        dpop_options,
+        portfolio_id,
+        isin,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_broker_savings_plan_config_response_with_session(
+    session_manager: &mut SessionManager,
+    env: TargetEnv,
+    env_cfg: &EnvConfig,
+    session: &mut Session,
+    access_context: crate::graphql::GraphqlAccessContext,
+    dpop_options: &crate::dpop::DpopRuntimeOptions,
+    portfolio_id: Option<&str>,
+    isin: &str,
+) -> Result<LoadedBrokerSavingsPlanConfig> {
+    let requested_isin = isin.trim().to_string();
+    if requested_isin.is_empty() {
         bail!("SAVINGS_PLAN_INPUT_INVALID: field 'isin' must be a non-empty string");
     }
-
-    let amount = normalize_positive_decimal_for_savings(args.amount.as_str(), "amount")?;
-    let amount_value = parse_positive_decimal_for_savings(amount.as_str(), "amount")?;
 
     let ids = resolve_broker_ids(
         session_manager,
         env,
-        &env_cfg,
-        &mut session,
+        env_cfg,
+        session,
         dpop_options,
-        args.portfolio_id.as_deref(),
+        portfolio_id,
     )?;
     let input = validated_broker_input(&ids, false, None)?;
 
-    let config_variables = broker_savings_plan_config_variables(&input, &isin)
+    let config_variables = broker_savings_plan_config_variables(&input, &requested_isin)
         .map_err(|err| anyhow!("SAVINGS_PLAN_INPUT_INVALID: {err}"))?;
-    let config_response = execute_with_refresh_retry(
+    let requested_isin = config_variables
+        .get("isin")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow!("Broker response invalid: missing normalized savings-plan isin"))?;
+    let response = execute_with_refresh_retry(
         session_manager,
         env,
-        &env_cfg,
-        &mut session,
+        env_cfg,
+        session,
         dpop_options,
         |token| {
             execute_graphql(
@@ -1739,59 +2037,258 @@ pub(crate) fn execute_broker_savings_plan_add(
         },
     )?;
 
-    let config_projected = project_broker_savings_plan_config_response(&config_response).map_err(
-        |_| {
+    Ok(LoadedBrokerSavingsPlanConfig {
+        ids,
+        requested_isin,
+        response,
+    })
+}
+
+pub(crate) fn execute_broker_savings_plan_config(
+    args: crate::cli::BrokerSavingsPlanConfigArgs,
+    config: &AppConfig,
+    session_manager: &mut SessionManager,
+) -> Result<Value> {
+    let loaded = load_broker_savings_plan_config_response(
+        config,
+        session_manager,
+        args.portfolio_id.as_deref(),
+        args.isin.as_str(),
+    )?;
+
+    let projected = project_broker_savings_plan_config_details_response(
+        &loaded.requested_isin,
+        &loaded.response,
+    )
+    .map_err(|_| {
             anyhow!(
                 "SAVINGS_PLAN_CONFIG_UNAVAILABLE: savings plan is not available for this instrument in the selected portfolio context"
             )
-        },
-    )?;
-    let parsed_config = parse_broker_savings_plan_config(&config_projected).map_err(|_| {
+        })?;
+    let raw_config = projected
+        .get("savings_plan_configuration")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let parsed_config = parse_broker_savings_plan_config(&raw_config).map_err(|_| {
         anyhow!(
             "SAVINGS_PLAN_CONFIG_UNAVAILABLE: savings plan is not available for this instrument in the selected portfolio context"
         )
     })?;
-    validate_amount_against_config(amount_value, &parsed_config)?;
-    let effective_config = resolve_effective_savings_plan_add_config(&args, &parsed_config)?;
+    let defaults = resolve_default_savings_plan_config(&parsed_config)?;
+    let result = project_public_broker_savings_plan_config_response(
+        &loaded.requested_isin,
+        &projected,
+        &parsed_config,
+        &defaults,
+    );
 
-    let mutation_variables = broker_create_or_update_savings_plan_variables(
-        &ids.portfolio_id,
-        &isin,
-        &amount,
-        effective_config.frequency.as_str(),
-        effective_config.day_of_month,
-        effective_config.year_month.as_str(),
-        effective_config.dynamization_rate.as_str(),
-        effective_config.payment_method.as_str(),
-        args.appropriateness_id.as_deref(),
-        args.acknowledged_appropriateness_warning_version.as_deref(),
-    )
-    .map_err(|err| anyhow!("SAVINGS_PLAN_INPUT_INVALID: {err}"))?;
+    Ok(broker_result_envelope(&loaded.ids, result))
+}
 
-    let mutation_response = execute_with_refresh_retry(
+pub(crate) fn execute_broker_savings_plan_add(
+    args: crate::cli::BrokerSavingsPlanAddArgs,
+    config: &AppConfig,
+    session_manager: &mut SessionManager,
+) -> Result<Value> {
+    if args.confirm.is_some() {
+        execute_broker_savings_plan_add_phase2(args, config, session_manager)
+    } else {
+        execute_broker_savings_plan_add_phase1(args, config, session_manager)
+    }
+}
+
+struct PreparedSavingsPlanAdd {
+    ids: ResolvedBrokerIds,
+    isin: String,
+    amount: String,
+    effective_configuration: Value,
+    security: Value,
+    costs: Value,
+    snapshot: Value,
+    snapshot_checksum: String,
+}
+
+fn execute_broker_savings_plan_add_phase1(
+    args: crate::cli::BrokerSavingsPlanAddArgs,
+    config: &AppConfig,
+    session_manager: &mut SessionManager,
+) -> Result<Value> {
+    assert_preview_allowed()?;
+    let dpop_options = crate::channel::current_dpop_runtime_options(config);
+    let dpop_options = &dpop_options;
+    let env = resolve_active_env(session_manager)?;
+    let env_cfg = crate::channel::current_env_config();
+    let loaded_session = load_active_session(session_manager, env, &env_cfg, dpop_options)?;
+    let mut session = loaded_session.session;
+    let access_context = loaded_session.access_context;
+    let prepared = prepare_savings_plan_add(
+        &args,
         session_manager,
         env,
         &env_cfg,
         &mut session,
+        access_context,
         dpop_options,
-        |token| {
-            execute_graphql(
-                &env_cfg.graphql_url,
-                token,
-                BROKER_CREATE_OR_UPDATE_SAVINGS_PLAN_MUTATION,
-                &mutation_variables,
-                Some("BrokerCreateOrUpdateSavingsPlan"),
-                access_context,
-                dpop_options,
-            )
-        },
     )?;
-    let mutation_projected =
-        project_broker_create_or_update_savings_plan_response(&mutation_response)?;
+    let now_epoch = current_epoch_seconds();
+    let confirmation_id = format!("scsp1_{:032x}", rand::random::<u128>());
+    let expires_at_epoch = now_epoch + 15 * 60;
+    let confirmation = SavingsPlanConfirmation {
+        confirmation_id: confirmation_id.clone(),
+        snapshot_checksum: prepared.snapshot_checksum.clone(),
+        created_at_epoch: now_epoch,
+        expires_at_epoch,
+        env: env.as_str().to_string(),
+        account_id: prepared.ids.account_id.clone(),
+        portfolio_id: prepared.ids.portfolio_id.clone(),
+        isin: prepared.isin.clone(),
+        snapshot: prepared.snapshot.clone(),
+    };
+    store_pending(confirmation)?;
 
-    let readback_variables = broker_savings_plan_by_isin_variables(&input, &isin)
-        .map_err(|err| anyhow!("SAVINGS_PLAN_INPUT_INVALID: {err}"))?;
-    let readback_response = execute_with_refresh_retry(
+    let confirmation_payload = json!({
+        "id": confirmation_id,
+        "intent_checksum": prepared.snapshot_checksum,
+        "expires_at_epoch": expires_at_epoch,
+        "command_template": savings_plan_command_template(&args, confirmation_id.as_str(), args.json),
+        "phase_2_command_template_json": savings_plan_command_template(&args, confirmation_id.as_str(), true),
+    });
+    let presentation = build_savings_plan_presentation(
+        &prepared.security,
+        prepared.amount.as_str(),
+        &prepared.effective_configuration,
+        "MUNC",
+        &prepared.costs,
+        &confirmation_payload,
+    )?;
+    Ok(broker_result_envelope(
+        &prepared.ids,
+        json!({
+            "action": "preview",
+            "security": prepared.security,
+            "input": requested_savings_plan_input(&args, prepared.isin.as_str(), prepared.amount.as_str()),
+            "effective_configuration": prepared.effective_configuration,
+            "cost_venue": "MUNC",
+            "ex_ante_costs": prepared.costs,
+            "confirmation": confirmation_payload,
+            "compliance": savings_plan_compliance_payload(),
+            "presentation": presentation,
+            "next_step": "confirm_with_id",
+        }),
+    ))
+}
+
+fn execute_broker_savings_plan_add_phase2(
+    args: crate::cli::BrokerSavingsPlanAddArgs,
+    config: &AppConfig,
+    session_manager: &mut SessionManager,
+) -> Result<Value> {
+    let confirmation_id = args
+        .confirm
+        .as_deref()
+        .ok_or_else(|| anyhow!("SAVINGS_PLAN_CONFIRMATION_NOT_FOUND: missing confirmation id"))?;
+    let now_epoch = current_epoch_seconds();
+    let stored = load_savings_plan_confirmation(confirmation_id, now_epoch)?;
+    let dpop_options = crate::channel::current_dpop_runtime_options(config);
+    let dpop_options = &dpop_options;
+    let env = resolve_active_env(session_manager)?;
+    if stored.env != env.as_str() {
+        bail!(
+            "SAVINGS_PLAN_CONFIRMATION_ENV_MISMATCH: confirmation env '{}' does not match active env '{}'",
+            stored.env,
+            env.as_str()
+        );
+    }
+    let env_cfg = crate::channel::current_env_config();
+    let loaded_session = load_active_session(session_manager, env, &env_cfg, dpop_options)?;
+    let mut session = loaded_session.session;
+    let access_context = loaded_session.access_context;
+    let prepared = prepare_savings_plan_add(
+        &args,
+        session_manager,
+        env,
+        &env_cfg,
+        &mut session,
+        access_context,
+        dpop_options,
+    )?;
+    ensure_phase2_savings_plan_matches(&stored, &prepared, env)?;
+    let mutation_variables = broker_create_or_update_savings_plan_variables(
+        &prepared.ids.portfolio_id,
+        &prepared.isin,
+        &prepared.amount,
+        prepared
+            .effective_configuration
+            .get("frequency")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        prepared
+            .effective_configuration
+            .get("day_of_month")
+            .and_then(Value::as_u64)
+            .and_then(|value| u8::try_from(value).ok())
+            .ok_or_else(|| {
+                anyhow!("SAVINGS_PLAN_CONFIRMATION_FIELDS_MISMATCH: invalid effective day")
+            })?,
+        prepared
+            .effective_configuration
+            .get("year_month")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        prepared
+            .effective_configuration
+            .get("dynamization_rate")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        prepared
+            .effective_configuration
+            .get("payment_method")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        args.appropriateness_id.as_deref(),
+        args.acknowledged_appropriateness_warning_version.as_deref(),
+    )
+    .map_err(|error| anyhow!("SAVINGS_PLAN_INPUT_INVALID: {error}"))?;
+    enforce_graphql_access_policy(
+        BROKER_CREATE_OR_UPDATE_SAVINGS_PLAN_MUTATION,
+        Some("BrokerCreateOrUpdateSavingsPlan"),
+        access_context,
+    )?;
+    let started = start_submission(
+        confirmation_id,
+        stored.snapshot_checksum.as_str(),
+        current_epoch_seconds(),
+    )?;
+    let mutation_response = execute_graphql_once(
+        &env_cfg.graphql_url,
+        &session.access_token,
+        BROKER_CREATE_OR_UPDATE_SAVINGS_PLAN_MUTATION,
+        &mutation_variables,
+        Some("BrokerCreateOrUpdateSavingsPlan"),
+        access_context,
+        dpop_options,
+    );
+    let mutation_projected = match mutation_response {
+        Ok(response) => match project_broker_create_or_update_savings_plan_response(&response) {
+            Ok(projected) => projected,
+            Err(error) => return savings_plan_unknown_submission_error(&started, error),
+        },
+        Err(error) if is_definitive_savings_plan_rejection(&error) => {
+            finalize_consumed(&started, current_epoch_seconds()).map_err(|_| {
+                anyhow!("SAVINGS_PLAN_SUBMISSION_UNKNOWN: backend rejected the submission but local state could not be finalized; inspect `sc broker savings-plans`")
+            })?;
+            return Err(anyhow!("SAVINGS_PLAN_SUBMISSION_FAILED: {error}"));
+        }
+        Err(error) => return savings_plan_unknown_submission_error(&started, error),
+    };
+    finalize_consumed(&started, current_epoch_seconds()).map_err(|_| {
+        anyhow!("SAVINGS_PLAN_SUBMISSION_UNKNOWN: mutation acknowledgement was received but local state could not be finalized; inspect `sc broker savings-plans`")
+    })?;
+
+    let input = validated_broker_input(&prepared.ids, false, None)?;
+    let readback_variables = broker_savings_plan_by_isin_variables(&input, &prepared.isin)
+        .map_err(|error| anyhow!("SAVINGS_PLAN_INPUT_INVALID: {error}"))?;
+    let readback = execute_with_refresh_retry(
         session_manager,
         env,
         &env_cfg,
@@ -1808,56 +2305,377 @@ pub(crate) fn execute_broker_savings_plan_add(
                 dpop_options,
             )
         },
-    )?;
-    let readback_projected = project_broker_savings_plan_by_isin_response(&readback_response)?;
-    let savings_plan = readback_projected
-        .get("savings_plan")
-        .cloned()
-        .unwrap_or(Value::Null);
-
-    Ok(json!({
-        "account_id": ids.account_id,
-        "portfolio_id": ids.portfolio_id,
-        "resolution": {
-            "account": ids.account_source,
-            "portfolio": ids.portfolio_source,
-        },
-        "result": {
-            "action": "create_or_update",
-            "security": readback_projected
-                .get("security")
+    )
+    .and_then(|response| project_broker_savings_plan_by_isin_response(&response));
+    let (security, savings_plan, warning) = match readback {
+        Ok(projected) => {
+            let savings_plan = projected
+                .get("savings_plan")
                 .cloned()
-                .unwrap_or(Value::Null),
-            "input": {
-                "isin": isin,
-                "amount": amount,
-                "frequency": args.frequency.map(|v| v.as_graphql()),
-                "day_of_month": args.day_of_month,
-                "year_month": args.year_month.as_deref(),
-                "dynamization_rate": args.dynamization_rate.as_deref(),
-                "payment_method": args.payment_method.map(|v| v.as_graphql()),
-                "appropriateness_id": args.appropriateness_id.as_deref(),
-                "acknowledged_appropriateness_warning_version": args.acknowledged_appropriateness_warning_version.as_deref(),
-            },
-            "effective_configuration": {
-                "frequency": effective_config.frequency,
-                "day_of_month": effective_config.day_of_month,
-                "year_month": effective_config.year_month,
-                "dynamization_rate": effective_config.dynamization_rate,
-                "payment_method": effective_config.payment_method,
-            },
-            "mutation_id": mutation_projected
-                .get("mutation_id")
-                .cloned()
-                .unwrap_or(Value::Null),
-            "savings_plan": savings_plan.clone(),
-            "warning": if savings_plan.is_null() {
-                Value::String("mutation completed but no active savings plan returned in readback".to_string())
+                .unwrap_or(Value::Null);
+            let warning = if savings_plan.is_null() {
+                Value::String(
+                    "mutation acknowledged but no active savings plan returned in readback"
+                        .to_string(),
+                )
             } else {
                 Value::Null
-            },
+            };
+            (
+                projected.get("security").cloned().unwrap_or(Value::Null),
+                savings_plan,
+                warning,
+            )
+        }
+        Err(error) => (
+            Value::Null,
+            Value::Null,
+            Value::String(format!(
+                "mutation acknowledged; readback failed: {}",
+                crate::user_error_message(&error)
+            )),
+        ),
+    };
+    Ok(broker_result_envelope(
+        &prepared.ids,
+        json!({
+            "action": "create_or_update",
+            "security": security,
+            "input": requested_savings_plan_input(&args, prepared.isin.as_str(), prepared.amount.as_str()),
+            "effective_configuration": prepared.effective_configuration,
+            "mutation_id": mutation_projected.get("mutation_id").cloned().unwrap_or(Value::Null),
+            "savings_plan": savings_plan,
+            "warning": warning,
+            "confirmation": {"id": confirmation_id, "consumed": true},
+            "next_step": "completed",
+        }),
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_savings_plan_add(
+    args: &crate::cli::BrokerSavingsPlanAddArgs,
+    session_manager: &mut SessionManager,
+    env: TargetEnv,
+    env_cfg: &EnvConfig,
+    session: &mut Session,
+    access_context: crate::graphql::GraphqlAccessContext,
+    dpop_options: &crate::dpop::DpopRuntimeOptions,
+) -> Result<PreparedSavingsPlanAdd> {
+    let loaded_config = load_broker_savings_plan_config_response_with_session(
+        session_manager,
+        env,
+        env_cfg,
+        session,
+        access_context,
+        dpop_options,
+        args.portfolio_id.as_deref(),
+        args.isin.as_str(),
+    )?;
+    let LoadedBrokerSavingsPlanConfig {
+        ids,
+        requested_isin: isin,
+        response: config_response,
+    } = loaded_config;
+    let amount = normalize_positive_decimal_for_savings(args.amount.as_str(), "amount")?;
+    let amount_value = parse_positive_decimal_for_savings(amount.as_str(), "amount")?;
+    let config_details = project_broker_savings_plan_config_details_response(&isin, &config_response)
+        .map_err(|_| anyhow!("SAVINGS_PLAN_CONFIG_UNAVAILABLE: savings plan is not available for this instrument in the selected portfolio context"))?;
+    let config_projected = config_details
+        .get("savings_plan_configuration")
+        .cloned()
+        .ok_or_else(|| {
+            anyhow!("SAVINGS_PLAN_CONFIG_UNAVAILABLE: savings plan configuration is unavailable")
+        })?;
+    let parsed_config = parse_broker_savings_plan_config(&config_projected).map_err(|_| {
+        anyhow!(
+            "SAVINGS_PLAN_CONFIG_UNAVAILABLE: savings plan is not available for this instrument in the selected portfolio context"
+        )
+    })?;
+    validate_amount_against_config(amount_value, &parsed_config)?;
+    let effective = resolve_effective_savings_plan_add_config(args, &parsed_config)?;
+    let effective_configuration = effective_savings_plan_config_value(&effective);
+    let input = validated_broker_input(&ids, false, None)?;
+    let cost_variables = broker_savings_plan_ex_ante_cost_variables(
+        &input,
+        &isin,
+        effective.frequency.as_str(),
+        &amount,
+    )
+    .map_err(|error| anyhow!("SAVINGS_PLAN_INPUT_INVALID: {error}"))?;
+    let costs_response = execute_with_refresh_retry(
+        session_manager,
+        env,
+        env_cfg,
+        session,
+        dpop_options,
+        |token| {
+            execute_graphql(
+                &env_cfg.graphql_url,
+                token,
+                BROKER_SAVINGS_PLAN_EX_ANTE_COSTS_QUERY,
+                &cost_variables,
+                Some("BrokerSavingsPlanExAnteCost"),
+                access_context,
+                dpop_options,
+            )
         },
-    }))
+    )
+    .map_err(|error| anyhow!("SAVINGS_PLAN_EX_ANTE_COST_UNAVAILABLE: {error}"))?;
+    let costs = project_broker_savings_plan_ex_ante_costs_response(&costs_response)?;
+    validate_savings_plan_ex_ante_costs(&costs)?;
+    let security = config_details
+        .get("security")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let snapshot = json!({
+        "env": env.as_str(),
+        "account_id": ids.account_id,
+        "portfolio_id": ids.portfolio_id,
+        "input": requested_savings_plan_input(args, isin.as_str(), amount.as_str()),
+        "effective_configuration": effective_configuration,
+        "cost_venue": "MUNC",
+        "ex_ante_costs": costs,
+    });
+    let snapshot_checksum = checksum_for_payload(&snapshot);
+    Ok(PreparedSavingsPlanAdd {
+        ids,
+        isin,
+        amount,
+        effective_configuration,
+        security,
+        costs,
+        snapshot,
+        snapshot_checksum,
+    })
+}
+
+fn effective_savings_plan_config_value(config: &ResolvedSavingsPlanAddConfig) -> Value {
+    json!({
+        "frequency": config.frequency,
+        "day_of_month": config.day_of_month,
+        "year_month": config.year_month,
+        "dynamization_rate": config.dynamization_rate,
+        "payment_method": config.payment_method,
+    })
+}
+
+fn requested_savings_plan_input(
+    args: &crate::cli::BrokerSavingsPlanAddArgs,
+    normalized_isin: &str,
+    amount: &str,
+) -> Value {
+    json!({
+        "isin": normalized_isin,
+        "amount": amount,
+        "frequency": args.frequency.map(|value| value.as_graphql()),
+        "day_of_month": args.day_of_month,
+        "year_month": normalized_optional_savings_plan_arg(args.year_month.as_deref()),
+        "dynamization_rate": normalized_optional_savings_plan_arg(args.dynamization_rate.as_deref()),
+        "payment_method": args.payment_method.map(|value| value.as_graphql()),
+        "appropriateness_id": normalized_optional_savings_plan_arg(args.appropriateness_id.as_deref()),
+        "acknowledged_appropriateness_warning_version": normalized_optional_savings_plan_arg(args.acknowledged_appropriateness_warning_version.as_deref()),
+    })
+}
+
+fn normalized_optional_savings_plan_arg(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn ensure_phase2_savings_plan_matches(
+    stored: &SavingsPlanConfirmation,
+    prepared: &PreparedSavingsPlanAdd,
+    env: TargetEnv,
+) -> Result<()> {
+    if stored.account_id != prepared.ids.account_id {
+        bail!(
+            "SAVINGS_PLAN_CONFIRMATION_ACCOUNT_MISMATCH: confirmation account '{}' does not match active account '{}'",
+            stored.account_id,
+            prepared.ids.account_id
+        );
+    }
+    if stored.portfolio_id != prepared.ids.portfolio_id {
+        bail!(
+            "SAVINGS_PLAN_CONFIRMATION_PORTFOLIO_MISMATCH: confirmation portfolio '{}' does not match active portfolio '{}'",
+            stored.portfolio_id,
+            prepared.ids.portfolio_id
+        );
+    }
+    if stored.env != env.as_str() || stored.snapshot_checksum != prepared.snapshot_checksum {
+        bail!(
+            "SAVINGS_PLAN_CONFIRMATION_FIELDS_MISMATCH: savings-plan configuration or disclosed costs changed; rerun phase 1"
+        );
+    }
+    Ok(())
+}
+
+fn savings_plan_unknown_submission_error<T>(
+    started: &crate::savings_plan_confirmation::StartedSavingsPlanSubmission,
+    error: anyhow::Error,
+) -> Result<T> {
+    let _ = finalize_unknown(started, current_epoch_seconds());
+    Err(anyhow!(
+        "SAVINGS_PLAN_SUBMISSION_UNKNOWN: {}. Inspect `sc broker savings-plans` for the matching account and portfolio before creating a new preview",
+        crate::user_error_message(&error)
+    ))
+}
+
+fn is_definitive_savings_plan_rejection(error: &anyhow::Error) -> bool {
+    let message = error.to_string();
+    message.contains("SAVINGS_PLAN_INPUT_INVALID:")
+        || message.contains(
+            "GraphQL returned errors for BrokerCreateOrUpdateSavingsPlan (code: BAD_USER_INPUT)",
+        )
+}
+
+fn savings_plan_compliance_payload() -> Value {
+    json!({
+        "rule_id": SAVINGS_PLAN_COMPLIANCE_RULE_ID,
+        "must_present_all_information": true,
+        "instruction": "Before running phase 2, you MUST present all phase-1 savings-plan information in a human-readable summary without omitting or changing values. Then obtain an explicit affirmative confirmation in a separate interaction. You MUST NOT execute phase 2 automatically, implicitly, or in the same step as phase 1 output.",
+        "requires_explicit_user_confirmation_between_phases": true,
+        "forbid_automatic_phase_2_execution": true,
+        "confirmation_must_be_separate_step": true,
+        "presentation": {
+            "format": SAVINGS_PLAN_PRESENTATION_FORMAT,
+            "section_order": ["savings_plan", "ex_ante_costs", "confirmation"],
+            "required_leaf_paths": savings_plan_required_leaf_paths(),
+            "preserve_exact_values": true,
+            "display_null_as_literal": true,
+            "raw_json_only_on_user_request": true,
+        }
+    })
+}
+
+fn savings_plan_command_template(
+    args: &crate::cli::BrokerSavingsPlanAddArgs,
+    confirmation_id: &str,
+    json_mode: bool,
+) -> String {
+    let mut command = format!(
+        "sc broker savings-plans add --isin {} --amount {}",
+        args.isin.trim(),
+        args.amount.trim()
+    );
+    if let Some(portfolio_id) = normalized_optional_savings_plan_arg(args.portfolio_id.as_deref()) {
+        command.push_str(&format!(" --portfolio-id {portfolio_id}"));
+    }
+    if let Some(frequency) = args.frequency {
+        let frequency = frequency
+            .to_possible_value()
+            .map(|value| value.get_name().to_string())
+            .unwrap_or_default();
+        command.push_str(&format!(" --frequency {frequency}"));
+    }
+    if let Some(day) = args.day_of_month {
+        command.push_str(&format!(" --day-of-month {day}"));
+    }
+    for (flag, value) in [
+        ("year-month", args.year_month.as_deref()),
+        ("dynamization-rate", args.dynamization_rate.as_deref()),
+        ("appropriateness-id", args.appropriateness_id.as_deref()),
+        (
+            "acknowledged-appropriateness-warning-version",
+            args.acknowledged_appropriateness_warning_version.as_deref(),
+        ),
+    ] {
+        if let Some(value) = normalized_optional_savings_plan_arg(value) {
+            command.push_str(&format!(" --{flag} {value}"));
+        }
+    }
+    if let Some(payment_method) = args.payment_method {
+        let payment_method = payment_method
+            .to_possible_value()
+            .map(|value| value.get_name().to_string())
+            .unwrap_or_default();
+        command.push_str(&format!(" --payment-method {payment_method}"));
+    }
+    command.push_str(&format!(" --confirm {confirmation_id}"));
+    if json_mode {
+        command.push_str(" --json");
+    }
+    command
+}
+
+fn validate_savings_plan_ex_ante_costs(costs: &Value) -> Result<()> {
+    let object = costs
+        .as_object()
+        .ok_or_else(|| unavailable_cost_error("cost payload must be an object"))?;
+    validate_cost_id(object.get("id"))?;
+    for group in ["entryCosts", "ongoingCosts", "exitCosts"] {
+        validate_cost_group(
+            object.get(group),
+            &["productCosts", "serviceCosts", "total"],
+        )?;
+    }
+    validate_cost_group(
+        object.get("effectOnReturn"),
+        &["initialYearCosts", "followingYearsCosts", "finalYearCosts"],
+    )?;
+    for group in ["fiveYearsCosts", "incidentalCosts"] {
+        validate_cost_leaf_group(object.get(group))?;
+    }
+    Ok(())
+}
+
+fn validate_cost_id(value: Option<&Value>) -> Result<()> {
+    match value {
+        Some(Value::String(_)) | Some(Value::Null) => Ok(()),
+        _ => Err(unavailable_cost_error("cost payload has invalid id")),
+    }
+}
+
+fn validate_cost_group(value: Option<&Value>, fields: &[&str]) -> Result<()> {
+    let Some(value) = value else {
+        return Err(unavailable_cost_error("cost payload is incomplete"));
+    };
+    if value.is_null() {
+        return Ok(());
+    }
+    let object = value
+        .as_object()
+        .ok_or_else(|| unavailable_cost_error("cost group must be an object or null"))?;
+    for field in fields {
+        validate_cost_leaf_group(object.get(*field))?;
+    }
+    Ok(())
+}
+
+fn validate_cost_leaf_group(value: Option<&Value>) -> Result<()> {
+    let Some(value) = value else {
+        return Err(unavailable_cost_error("cost leaf group is missing"));
+    };
+    if value.is_null() {
+        return Ok(());
+    }
+    let object = value
+        .as_object()
+        .ok_or_else(|| unavailable_cost_error("cost leaf group must be an object or null"))?;
+    for field in ["amount", "percentage"] {
+        match object.get(field) {
+            Some(Value::String(_)) | Some(Value::Number(_)) | Some(Value::Null) => {}
+            _ => {
+                return Err(unavailable_cost_error(
+                    "cost amount or percentage is missing or malformed",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn unavailable_cost_error(detail: &str) -> anyhow::Error {
+    anyhow!("SAVINGS_PLAN_EX_ANTE_COST_UNAVAILABLE: {detail}")
+}
+
+fn current_epoch_seconds() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 pub(crate) fn execute_broker_savings_plan_remove(
@@ -1908,15 +2726,7 @@ pub(crate) fn execute_broker_savings_plan_remove(
     )?;
     let projected = project_broker_remove_savings_plan_response(&requested_isin, &response)?;
 
-    Ok(json!({
-        "account_id": ids.account_id,
-        "portfolio_id": ids.portfolio_id,
-        "resolution": {
-            "account": ids.account_source,
-            "portfolio": ids.portfolio_source,
-        },
-        "result": projected,
-    }))
+    Ok(broker_result_envelope(&ids, projected))
 }
 
 #[derive(Debug, Clone)]
@@ -2145,6 +2955,120 @@ fn parse_string_array_for_savings(raw: Option<&Value>, error: &str) -> Result<Ve
     Ok(values)
 }
 
+fn resolve_default_savings_plan_config(
+    config: &ParsedBrokerSavingsPlanConfig,
+) -> Result<ResolvedSavingsPlanAddConfig> {
+    let frequency = if config.frequencies.iter().any(|f| f == "MONTHLY") {
+        "MONTHLY".to_string()
+    } else {
+        config.frequencies[0].clone()
+    };
+
+    let selected_schedule = config
+        .schedules
+        .iter()
+        .find(|schedule| schedule.is_default)
+        .or_else(|| {
+            config
+                .schedules
+                .iter()
+                .find(|schedule| schedule.is_earliest)
+        })
+        .or_else(|| {
+            config
+                .schedules
+                .iter()
+                .min_by_key(|schedule| schedule.day_of_month)
+        })
+        .ok_or_else(|| {
+            anyhow!("SAVINGS_PLAN_CONFIG_UNAVAILABLE: no valid schedule found in config")
+        })?;
+
+    let year_month = selected_schedule
+        .available_year_months
+        .iter()
+        .min()
+        .cloned()
+        .ok_or_else(|| {
+            anyhow!("SAVINGS_PLAN_CONFIG_UNAVAILABLE: no available yearMonth for selected schedule")
+        })?;
+
+    let dynamization_rate = normalize_non_negative_decimal_for_savings(
+        config.default_dynamization_rate.as_str(),
+        "dynamization_rate",
+    )?;
+
+    let payment_method = if config
+        .payment_methods
+        .iter()
+        .any(|method| method == "REFERENCE_ACCOUNT")
+    {
+        "REFERENCE_ACCOUNT".to_string()
+    } else {
+        config.payment_methods[0].clone()
+    };
+
+    Ok(ResolvedSavingsPlanAddConfig {
+        frequency,
+        day_of_month: selected_schedule.day_of_month,
+        year_month,
+        dynamization_rate,
+        payment_method,
+    })
+}
+
+fn project_public_broker_savings_plan_config_response(
+    requested_isin: &str,
+    projected: &Value,
+    config: &ParsedBrokerSavingsPlanConfig,
+    defaults: &ResolvedSavingsPlanAddConfig,
+) -> Value {
+    let mut schedules = config.schedules.clone();
+    schedules.sort_by_key(|schedule| schedule.day_of_month);
+
+    json!({
+        "security": {
+            "isin": projected
+                .get("security")
+                .and_then(|security| security.get("isin"))
+                .cloned()
+                .unwrap_or_else(|| Value::String(requested_isin.to_string())),
+            "name": projected
+                .get("security")
+                .and_then(|security| security.get("name"))
+                .cloned()
+                .unwrap_or(Value::Null),
+            "security_type": projected
+                .get("security")
+                .and_then(|security| security.get("security_type"))
+                .cloned()
+                .unwrap_or(Value::Null),
+        },
+        "amount_limits": {
+            "min": config.min_amount.to_string(),
+            "max": config.max_amount.to_string(),
+        },
+        "defaults": {
+            "frequency": defaults.frequency.clone(),
+            "day_of_month": defaults.day_of_month,
+            "year_month": defaults.year_month.clone(),
+            "dynamization_rate": defaults.dynamization_rate.clone(),
+            "payment_method": defaults.payment_method.clone(),
+        },
+        "frequencies": config.frequencies.clone(),
+        "payment_methods": config.payment_methods.clone(),
+        "dynamization_rates": config.dynamization_rates.clone(),
+        "schedules": schedules.iter().map(|schedule| {
+            json!({
+                "day_of_month": schedule.day_of_month,
+                "is_default": schedule.is_default,
+                "is_earliest": schedule.is_earliest,
+                "available_year_months": schedule.available_year_months.clone(),
+            })
+        }).collect::<Vec<_>>(),
+    })
+}
+
 fn validate_amount_against_config(
     amount: f64,
     config: &ParsedBrokerSavingsPlanConfig,
@@ -2163,6 +3087,8 @@ fn resolve_effective_savings_plan_add_config(
     args: &crate::cli::BrokerSavingsPlanAddArgs,
     config: &ParsedBrokerSavingsPlanConfig,
 ) -> Result<ResolvedSavingsPlanAddConfig> {
+    let defaults = resolve_default_savings_plan_config(config)?;
+
     let frequency = match args.frequency {
         Some(value) => {
             let gql = value.as_graphql().to_string();
@@ -2171,13 +3097,7 @@ fn resolve_effective_savings_plan_add_config(
             }
             gql
         }
-        None => {
-            if config.frequencies.iter().any(|f| f == "MONTHLY") {
-                "MONTHLY".to_string()
-            } else {
-                config.frequencies[0].clone()
-            }
-        }
+        None => defaults.frequency.clone(),
     };
 
     let selected_schedule = match args.day_of_month {
@@ -2191,19 +3111,7 @@ fn resolve_effective_savings_plan_add_config(
         None => config
             .schedules
             .iter()
-            .find(|schedule| schedule.is_default)
-            .or_else(|| {
-                config
-                    .schedules
-                    .iter()
-                    .find(|schedule| schedule.is_earliest)
-            })
-            .or_else(|| {
-                config
-                    .schedules
-                    .iter()
-                    .min_by_key(|schedule| schedule.day_of_month)
-            })
+            .find(|schedule| schedule.day_of_month == defaults.day_of_month)
             .ok_or_else(|| {
                 anyhow!("SAVINGS_PLAN_CONFIG_UNAVAILABLE: no valid schedule found in config")
             })?,
@@ -2223,16 +3131,7 @@ fn resolve_effective_savings_plan_add_config(
             }
             normalized
         }
-        None => selected_schedule
-            .available_year_months
-            .iter()
-            .min()
-            .cloned()
-            .ok_or_else(|| {
-                anyhow!(
-                    "SAVINGS_PLAN_CONFIG_UNAVAILABLE: no available yearMonth for selected schedule"
-                )
-            })?,
+        None => defaults.year_month.clone(),
     };
 
     let dynamization_rate = match args.dynamization_rate.as_deref() {
@@ -2249,10 +3148,7 @@ fn resolve_effective_savings_plan_add_config(
             }
             normalized
         }
-        None => normalize_non_negative_decimal_for_savings(
-            config.default_dynamization_rate.as_str(),
-            "dynamization_rate",
-        )?,
+        None => defaults.dynamization_rate.clone(),
     };
 
     let payment_method = match args.payment_method {
@@ -2263,18 +3159,7 @@ fn resolve_effective_savings_plan_add_config(
             }
             gql
         }
-        None => {
-            let preferred = "REFERENCE_ACCOUNT";
-            if config
-                .payment_methods
-                .iter()
-                .any(|method| method == preferred)
-            {
-                preferred.to_string()
-            } else {
-                config.payment_methods[0].clone()
-            }
-        }
+        None => defaults.payment_method.clone(),
     };
 
     Ok(ResolvedSavingsPlanAddConfig {
@@ -2314,6 +3199,7 @@ mod tests {
             payment_method: None,
             appropriateness_id: None,
             acknowledged_appropriateness_warning_version: None,
+            confirm: None,
             json: false,
         }
     }
@@ -2336,6 +3222,468 @@ mod tests {
                 available_year_months: vec!["2026-04".to_string(), "2026-05".to_string()],
             }],
         }
+    }
+
+    fn sample_savings_plan_costs() -> Value {
+        json!({
+            "id": "cost-1",
+            "entryCosts": {
+                "productCosts": {"amount": "1", "percentage": "0.1"},
+                "serviceCosts": {"amount": "2", "percentage": "0.2"},
+                "total": {"amount": "3", "percentage": "0.3"}
+            },
+            "ongoingCosts": {
+                "productCosts": {"amount": "1", "percentage": "0.1"},
+                "serviceCosts": {"amount": "2", "percentage": "0.2"},
+                "total": {"amount": "3", "percentage": "0.3"}
+            },
+            "exitCosts": {
+                "productCosts": {"amount": "1", "percentage": "0.1"},
+                "serviceCosts": {"amount": "2", "percentage": "0.2"},
+                "total": {"amount": "3", "percentage": "0.3"}
+            },
+            "effectOnReturn": {
+                "initialYearCosts": {"amount": "1", "percentage": "0.1"},
+                "followingYearsCosts": {"amount": "2", "percentage": "0.2"},
+                "finalYearCosts": {"amount": "3", "percentage": "0.3"}
+            },
+            "fiveYearsCosts": {"amount": "4", "percentage": "0.4"},
+            "incidentalCosts": null
+        })
+    }
+
+    fn sample_savings_plan_config_response() -> &'static str {
+        r#"{
+            "data": {
+                "account": {
+                    "brokerPortfolio": {
+                        "security": {
+                            "isin": "US0378331005",
+                            "name": "Apple Inc.",
+                            "type": "STOCK",
+                            "savingsPlanConfiguration": {
+                                "schedules": [{
+                                    "dayOfTheMonth": 5,
+                                    "isEarliest": true,
+                                    "isDefault": true,
+                                    "yearMonths": [{ "yearMonth": "2026-04", "isAvailable": true }]
+                                }],
+                                "minSavingsPlanAmount": "1",
+                                "maxSavingsPlanAmount": "10000",
+                                "dynamizationRates": [0, 1.5],
+                                "defaultDynamizationRate": 0,
+                                "paymentMethods": ["REFERENCE_ACCOUNT"],
+                                "frequencies": ["MONTHLY"]
+                            }
+                        }
+                    }
+                }
+            }
+        }"#
+    }
+
+    fn savings_plan_cost_response(costs: Value) -> String {
+        json!({
+            "data": {
+                "account": {
+                    "brokerPortfolio": {
+                        "savingsPlanExAnteCosts": costs,
+                    }
+                }
+            }
+        })
+        .to_string()
+    }
+
+    fn save_active_test_session(session_manager: &mut SessionManager, config: &AppConfig) {
+        session_manager
+            .save_active(&StoredSession {
+                env: crate::channel::current_env(),
+                session: sample_session(),
+                dpop_jwk_thumbprint: Some(current_runtime_dpop_thumbprint(config)),
+                mode: None,
+            })
+            .expect("save session");
+    }
+
+    #[test]
+    fn strict_savings_plan_cost_validation_preserves_explicit_nulls_and_rejects_missing_leaves() {
+        validate_savings_plan_ex_ante_costs(&sample_savings_plan_costs())
+            .expect("explicit null cost group is valid");
+
+        let mut malformed = sample_savings_plan_costs();
+        malformed["entryCosts"]["total"] = json!({"amount": "3"});
+        let err = validate_savings_plan_ex_ante_costs(&malformed).expect_err("missing percentage");
+        assert!(
+            err.to_string()
+                .contains("SAVINGS_PLAN_EX_ANTE_COST_UNAVAILABLE:")
+        );
+    }
+
+    #[test]
+    fn savings_plan_preview_returns_full_cost_disclosure_and_never_submits() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut server = Server::new();
+        let _channel_guard = TestChannelGuard::for_server(&server);
+        let _cfg_guard = EnvGuard::set("SC_CONFIG_DIR", tmp.path().to_string_lossy().to_string());
+        let config_mock = server
+            .mock("POST", "/")
+            .match_header("authorization", expected_authorization_header())
+            .match_body(mockito::Matcher::Regex(
+                "BrokerSavingsPlanConfig".to_string(),
+            ))
+            .match_body(mockito::Matcher::PartialJson(json!({
+                "variables": {
+                    "accountId": "person-1",
+                    "portfolioId": "portfolio-1",
+                    "isin": "US0378331005"
+                }
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(sample_savings_plan_config_response())
+            .expect(1)
+            .create();
+        let costs = sample_savings_plan_costs();
+        let costs_mock = server
+            .mock("POST", "/")
+            .match_header("authorization", expected_authorization_header())
+            .match_body(mockito::Matcher::Regex(
+                "BrokerSavingsPlanExAnteCost".to_string(),
+            ))
+            .match_body(mockito::Matcher::PartialJson(json!({
+                "variables": {
+                    "accountId": "person-1",
+                    "portfolioId": "portfolio-1",
+                    "isin": "US0378331005",
+                    "frequency": "MONTHLY",
+                    "amount": "100",
+                    "venue": "MUNC"
+                }
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(savings_plan_cost_response(costs.clone()))
+            .expect(1)
+            .create();
+        let mutation_mock = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                "BrokerCreateOrUpdateSavingsPlan".to_string(),
+            ))
+            .expect(0)
+            .create();
+
+        let config = sample_runtime_config();
+        ensure_runtime_dpop_key(&config);
+        let mut session_manager = file_session_manager(&tmp);
+        save_active_test_session(&mut session_manager, &config);
+        let mut args = sample_args();
+        args.portfolio_id = Some("portfolio-1".to_string());
+        args.isin = "us0378331005".to_string();
+
+        let payload = execute_broker_savings_plan_add(args, &config, &mut session_manager)
+            .expect("preview payload");
+        let result = &payload["result"];
+        let confirmation_id = result["confirmation"]["id"]
+            .as_str()
+            .expect("confirmation id");
+
+        assert_eq!(result["action"], "preview");
+        assert_eq!(result["input"]["isin"], "US0378331005");
+        assert_eq!(result["cost_venue"], "MUNC");
+        assert_eq!(result["ex_ante_costs"], costs);
+        assert_eq!(result["next_step"], "confirm_with_id");
+        assert!(confirmation_id.starts_with("scsp1_"));
+        assert!(
+            result["presentation"]["required_leaf_paths"]
+                .as_array()
+                .expect("paths")
+                .iter()
+                .any(|path| path == "ex_ante_costs.entryCosts.total.percentage")
+        );
+        let stored = load_savings_plan_confirmation(confirmation_id, current_epoch_seconds())
+            .expect("stored confirmation");
+        assert_eq!(stored.snapshot["input"]["isin"], "US0378331005");
+
+        config_mock.assert();
+        costs_mock.assert();
+        mutation_mock.assert();
+    }
+
+    #[test]
+    fn malformed_preview_costs_leave_an_existing_confirmation_unchanged_and_do_not_submit() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut server = Server::new();
+        let _channel_guard = TestChannelGuard::for_server(&server);
+        let _cfg_guard = EnvGuard::set("SC_CONFIG_DIR", tmp.path().to_string_lossy().to_string());
+        let now_epoch = current_epoch_seconds();
+        let existing_snapshot = json!({"existing": true});
+        let existing = SavingsPlanConfirmation {
+            confirmation_id: "scsp1_existing".to_string(),
+            snapshot_checksum: checksum_for_payload(&existing_snapshot),
+            created_at_epoch: now_epoch,
+            expires_at_epoch: now_epoch + 900,
+            env: crate::channel::current_env().as_str().to_string(),
+            account_id: "person-1".to_string(),
+            portfolio_id: "portfolio-1".to_string(),
+            isin: "US0378331005".to_string(),
+            snapshot: existing_snapshot,
+        };
+        store_pending(existing).expect("store existing confirmation");
+        let config_mock = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                "BrokerSavingsPlanConfig".to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(sample_savings_plan_config_response())
+            .expect(1)
+            .create();
+        let mut malformed_costs = sample_savings_plan_costs();
+        malformed_costs["entryCosts"]["total"] = json!({"amount": "3"});
+        let costs_mock = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                "BrokerSavingsPlanExAnteCost".to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(savings_plan_cost_response(malformed_costs))
+            .expect(1)
+            .create();
+        let mutation_mock = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                "BrokerCreateOrUpdateSavingsPlan".to_string(),
+            ))
+            .expect(0)
+            .create();
+
+        let config = sample_runtime_config();
+        ensure_runtime_dpop_key(&config);
+        let mut session_manager = file_session_manager(&tmp);
+        save_active_test_session(&mut session_manager, &config);
+        let mut args = sample_args();
+        args.portfolio_id = Some("portfolio-1".to_string());
+
+        let err = execute_broker_savings_plan_add(args, &config, &mut session_manager)
+            .expect_err("malformed costs must fail closed");
+        assert!(
+            err.to_string()
+                .contains("SAVINGS_PLAN_EX_ANTE_COST_UNAVAILABLE:")
+        );
+        let stored = load_savings_plan_confirmation("scsp1_existing", current_epoch_seconds())
+            .expect("existing confirmation remains");
+        assert_eq!(stored.snapshot, json!({"existing": true}));
+
+        config_mock.assert();
+        costs_mock.assert();
+        mutation_mock.assert();
+    }
+
+    #[test]
+    fn savings_plan_confirmation_submits_one_mutation_after_fresh_preview_validation() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut server = Server::new();
+        let _channel_guard = TestChannelGuard::for_server(&server);
+        let _cfg_guard = EnvGuard::set("SC_CONFIG_DIR", tmp.path().to_string_lossy().to_string());
+        let config_mock = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                "BrokerSavingsPlanConfig".to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(sample_savings_plan_config_response())
+            .expect(2)
+            .create();
+        let costs_mock = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                "BrokerSavingsPlanExAnteCost".to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(savings_plan_cost_response(sample_savings_plan_costs()))
+            .expect(2)
+            .create();
+        let mutation_mock = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                "BrokerCreateOrUpdateSavingsPlan".to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"data":{"createOrUpdateSavingsPlan":{"id":"mutation-1"}}}"#)
+            .expect(1)
+            .create();
+        let readback_mock = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex("BrokerSavingsPlanByIsin".to_string()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{
+                "data": {
+                    "account": {
+                        "brokerPortfolio": {
+                            "security": {
+                                "isin": "US0378331005",
+                                "name": "Apple Inc.",
+                                "type": "STOCK",
+                                "inventory": {
+                                    "savingsPlan": {
+                                        "isin": "US0378331005",
+                                        "amount": "100",
+                                        "frequency": "MONTHLY",
+                                        "dayOfTheMonth": 5,
+                                        "dynamizationRate": "0",
+                                        "paymentMethod": "REFERENCE_ACCOUNT",
+                                        "nextExecutionDate": {"date": "2026-04-05", "epochDay": 20548}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }"#)
+            .expect(1)
+            .create();
+
+        let config = sample_runtime_config();
+        ensure_runtime_dpop_key(&config);
+        let mut session_manager = file_session_manager(&tmp);
+        save_active_test_session(&mut session_manager, &config);
+        let mut phase1 = sample_args();
+        phase1.portfolio_id = Some("portfolio-1".to_string());
+        let preview = execute_broker_savings_plan_add(phase1, &config, &mut session_manager)
+            .expect("preview");
+        let confirmation_id = preview["result"]["confirmation"]["id"]
+            .as_str()
+            .expect("confirmation id")
+            .to_string();
+        let mut phase2 = sample_args();
+        phase2.portfolio_id = Some("portfolio-1".to_string());
+        phase2.confirm = Some(confirmation_id.clone());
+
+        let payload = execute_broker_savings_plan_add(phase2, &config, &mut session_manager)
+            .expect("confirmation submission");
+        assert_eq!(payload["result"]["action"], "create_or_update");
+        assert_eq!(payload["result"]["mutation_id"], "mutation-1");
+        assert_eq!(
+            payload["result"]["confirmation"],
+            json!({"id": confirmation_id, "consumed": true})
+        );
+        assert_eq!(payload["result"]["savings_plan"]["amount"], "100");
+        let consumed = load_savings_plan_confirmation(
+            payload["result"]["confirmation"]["id"]
+                .as_str()
+                .expect("confirmation id"),
+            current_epoch_seconds(),
+        )
+        .expect_err("consumed confirmation cannot be reused");
+        assert!(
+            consumed
+                .to_string()
+                .contains("SAVINGS_PLAN_CONFIRMATION_ALREADY_USED:")
+        );
+
+        config_mock.assert();
+        costs_mock.assert();
+        mutation_mock.assert();
+        readback_mock.assert();
+    }
+
+    #[test]
+    fn savings_plan_malformed_acknowledgement_is_not_retried_and_blocks_new_previews() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut server = Server::new();
+        let _channel_guard = TestChannelGuard::for_server(&server);
+        let _cfg_guard = EnvGuard::set("SC_CONFIG_DIR", tmp.path().to_string_lossy().to_string());
+        let config_mock = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                "BrokerSavingsPlanConfig".to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(sample_savings_plan_config_response())
+            .expect(2)
+            .create();
+        let costs_mock = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                "BrokerSavingsPlanExAnteCost".to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(savings_plan_cost_response(sample_savings_plan_costs()))
+            .expect(2)
+            .create();
+        let mutation_mock = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                "BrokerCreateOrUpdateSavingsPlan".to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"data":{"createOrUpdateSavingsPlan":null}}"#)
+            .expect(1)
+            .create();
+
+        let config = sample_runtime_config();
+        ensure_runtime_dpop_key(&config);
+        let mut session_manager = file_session_manager(&tmp);
+        save_active_test_session(&mut session_manager, &config);
+        let mut phase1 = sample_args();
+        phase1.portfolio_id = Some("portfolio-1".to_string());
+        let preview = execute_broker_savings_plan_add(phase1, &config, &mut session_manager)
+            .expect("preview");
+        let confirmation_id = preview["result"]["confirmation"]["id"]
+            .as_str()
+            .expect("confirmation id")
+            .to_string();
+        let mut phase2 = sample_args();
+        phase2.portfolio_id = Some("portfolio-1".to_string());
+        phase2.confirm = Some(confirmation_id.clone());
+
+        let err = execute_broker_savings_plan_add(phase2, &config, &mut session_manager)
+            .expect_err("malformed acknowledgement leaves mutation outcome unknown");
+        assert!(err.to_string().contains("SAVINGS_PLAN_SUBMISSION_UNKNOWN:"));
+        let mut retry_phase2 = sample_args();
+        retry_phase2.portfolio_id = Some("portfolio-1".to_string());
+        retry_phase2.confirm = Some(confirmation_id);
+        let retry_err =
+            execute_broker_savings_plan_add(retry_phase2, &config, &mut session_manager)
+                .expect_err("the same confirmation must not resend a mutation");
+        assert!(
+            retry_err
+                .to_string()
+                .contains("SAVINGS_PLAN_SUBMISSION_UNKNOWN:")
+        );
+        assert!(assert_preview_allowed().is_err());
+
+        config_mock.assert();
+        costs_mock.assert();
+        mutation_mock.assert();
+    }
+
+    #[test]
+    fn savings_plan_only_treats_explicit_validation_errors_as_definitive_rejections() {
+        assert!(is_definitive_savings_plan_rejection(&anyhow!(
+            "GraphQL returned errors for BrokerCreateOrUpdateSavingsPlan (code: BAD_USER_INPUT)"
+        )));
+        assert!(!is_definitive_savings_plan_rejection(&anyhow!(
+            "GraphQL returned errors for BrokerCreateOrUpdateSavingsPlan (code: INTERNAL_SERVER_ERROR)"
+        )));
+    }
+
+    #[test]
+    fn savings_plan_phase2_template_keeps_confirm_before_json() {
+        let args = sample_args();
+        let template = savings_plan_command_template(&args, "scsp1_confirm", true);
+        assert!(template.contains("--confirm scsp1_confirm --json"));
     }
 
     #[test]
@@ -2401,6 +3749,108 @@ mod tests {
         let resolved = resolve_effective_savings_plan_add_config(&args, &config).expect("resolve");
 
         assert_eq!(resolved.year_month, "2026-04");
+    }
+
+    #[test]
+    fn resolve_default_savings_plan_config_uses_reference_account_and_sorted_month() {
+        let mut config = sample_config();
+        config.schedules[0].available_year_months = vec![
+            "2026-08".to_string(),
+            "2026-06".to_string(),
+            "2026-07".to_string(),
+        ];
+
+        let resolved = resolve_default_savings_plan_config(&config).expect("resolve");
+
+        assert_eq!(resolved.frequency, "MONTHLY");
+        assert_eq!(resolved.day_of_month, 5);
+        assert_eq!(resolved.year_month, "2026-06");
+        assert_eq!(resolved.dynamization_rate, "0");
+        assert_eq!(resolved.payment_method, "REFERENCE_ACCOUNT");
+    }
+
+    #[test]
+    fn resolve_default_savings_plan_config_falls_back_without_monthly_or_reference_account() {
+        let mut config = sample_config();
+        config.frequencies = vec!["QUARTERLY".to_string(), "ANNUALLY".to_string()];
+        config.payment_methods = vec!["CASH_BALANCE".to_string()];
+        config.schedules = vec![
+            ParsedBrokerSavingsPlanSchedule {
+                day_of_month: 9,
+                is_default: false,
+                is_earliest: true,
+                available_year_months: vec!["2026-09".to_string()],
+            },
+            ParsedBrokerSavingsPlanSchedule {
+                day_of_month: 4,
+                is_default: false,
+                is_earliest: false,
+                available_year_months: vec!["2026-08".to_string()],
+            },
+        ];
+
+        let resolved = resolve_default_savings_plan_config(&config).expect("resolve");
+
+        assert_eq!(resolved.frequency, "QUARTERLY");
+        assert_eq!(resolved.day_of_month, 9);
+        assert_eq!(resolved.payment_method, "CASH_BALANCE");
+    }
+
+    #[test]
+    fn resolve_default_savings_plan_config_falls_back_to_lowest_day_when_no_flags_exist() {
+        let mut config = sample_config();
+        config.schedules = vec![
+            ParsedBrokerSavingsPlanSchedule {
+                day_of_month: 12,
+                is_default: false,
+                is_earliest: false,
+                available_year_months: vec!["2026-12".to_string()],
+            },
+            ParsedBrokerSavingsPlanSchedule {
+                day_of_month: 3,
+                is_default: false,
+                is_earliest: false,
+                available_year_months: vec!["2026-03".to_string()],
+            },
+        ];
+
+        let resolved = resolve_default_savings_plan_config(&config).expect("resolve");
+
+        assert_eq!(resolved.day_of_month, 3);
+        assert_eq!(resolved.year_month, "2026-03");
+    }
+
+    #[test]
+    fn project_public_broker_savings_plan_config_response_maps_public_shape() {
+        let projected = json!({
+            "security": {
+                "isin": "US0378331005",
+                "name": "Apple Inc.",
+                "security_type": "STOCK"
+            }
+        });
+        let config = sample_config();
+        let defaults = resolve_default_savings_plan_config(&config).expect("resolve");
+
+        let public = project_public_broker_savings_plan_config_response(
+            "US0378331005",
+            &projected,
+            &config,
+            &defaults,
+        );
+
+        assert_eq!(public["security"]["isin"], "US0378331005");
+        assert_eq!(public["security"]["name"], "Apple Inc.");
+        assert_eq!(public["security"]["security_type"], "STOCK");
+        assert_eq!(public["amount_limits"]["min"], "1");
+        assert_eq!(public["amount_limits"]["max"], "10000");
+        assert_eq!(public["defaults"]["frequency"], "MONTHLY");
+        assert_eq!(public["defaults"]["payment_method"], "REFERENCE_ACCOUNT");
+        assert_eq!(public["schedules"][0]["day_of_month"], 5);
+        assert_eq!(
+            public["schedules"][0]["available_year_months"][0],
+            "2026-04"
+        );
     }
 
     #[test]
@@ -2823,6 +4273,263 @@ mod tests {
     }
 
     #[test]
+    fn execute_broker_savings_plan_config_returns_public_result_envelope() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut server = Server::new();
+        let _channel_guard = TestChannelGuard::for_server(&server);
+        let _cfg_guard = EnvGuard::set("SC_CONFIG_DIR", tmp.path().to_string_lossy().to_string());
+
+        let config_mock = server
+            .mock("POST", "/")
+            .match_header("authorization", expected_authorization_header())
+            .match_body(mockito::Matcher::Regex(
+                "BrokerSavingsPlanConfig".to_string(),
+            ))
+            .match_body(mockito::Matcher::PartialJson(json!({
+                "variables": {
+                    "accountId": "person-1",
+                    "portfolioId": "portfolio-1",
+                    "isin": "US0378331005"
+                }
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{
+                    "data": {
+                        "account": {
+                            "brokerPortfolio": {
+                                "security": {
+                                    "isin": "US0378331005",
+                                    "name": "Apple Inc.",
+                                    "type": "STOCK",
+                                    "savingsPlanConfiguration": {
+                                        "schedules": [
+                                            {
+                                                "dayOfTheMonth": 1,
+                                                "isEarliest": true,
+                                                "isDefault": true,
+                                                "yearMonths": [
+                                                    { "yearMonth": "2026-07", "isAvailable": true },
+                                                    { "yearMonth": "2026-08", "isAvailable": true }
+                                                ]
+                                            }
+                                        ],
+                                        "minSavingsPlanAmount": "25",
+                                        "maxSavingsPlanAmount": "5000",
+                                        "defaultMinSavingsPlanAmount": "25",
+                                        "dynamizationRates": [0, 1.5],
+                                        "defaultDynamizationRate": 0,
+                                        "paymentMethods": ["CASH_BALANCE", "REFERENCE_ACCOUNT"],
+                                        "frequencies": ["QUARTERLY", "MONTHLY"]
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }"#,
+            )
+            .create();
+
+        let config = sample_runtime_config();
+        ensure_runtime_dpop_key(&config);
+        let mut session_manager = file_session_manager(&tmp);
+        session_manager
+            .save_active(&StoredSession {
+                env: crate::channel::current_env(),
+                session: sample_session(),
+                dpop_jwk_thumbprint: Some(current_runtime_dpop_thumbprint(&config)),
+                mode: None,
+            })
+            .expect("save session");
+
+        let payload = execute_broker_savings_plan_config(
+            crate::cli::BrokerSavingsPlanConfigArgs {
+                portfolio_id: Some("portfolio-1".to_string()),
+                isin: "us0378331005".to_string(),
+                json: true,
+            },
+            &config,
+            &mut session_manager,
+        )
+        .expect("config payload");
+
+        assert_eq!(payload["account_id"], "person-1");
+        assert_eq!(payload["portfolio_id"], "portfolio-1");
+        assert_eq!(payload["result"]["security"]["name"], "Apple Inc.");
+        assert_eq!(payload["result"]["amount_limits"]["min"], "25");
+        assert_eq!(payload["result"]["defaults"]["frequency"], "MONTHLY");
+        assert_eq!(
+            payload["result"]["defaults"]["payment_method"],
+            "REFERENCE_ACCOUNT"
+        );
+        assert_eq!(payload["result"]["schedules"][0]["day_of_month"], 1);
+
+        config_mock.assert();
+    }
+
+    #[test]
+    fn run_broker_command_human_routes_savings_plan_config_to_text_output() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut server = Server::new();
+        let _channel_guard = TestChannelGuard::for_server(&server);
+        let _cfg_guard = EnvGuard::set("SC_CONFIG_DIR", tmp.path().to_string_lossy().to_string());
+
+        let config_mock = server
+            .mock("POST", "/")
+            .match_header("authorization", expected_authorization_header())
+            .match_body(mockito::Matcher::Regex(
+                "BrokerSavingsPlanConfig".to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{
+                    "data": {
+                        "account": {
+                            "brokerPortfolio": {
+                                "security": {
+                                    "isin": "US0378331005",
+                                    "name": "Apple Inc.",
+                                    "type": "STOCK",
+                                    "savingsPlanConfiguration": {
+                                        "schedules": [
+                                            {
+                                                "dayOfTheMonth": 1,
+                                                "isEarliest": true,
+                                                "isDefault": true,
+                                                "yearMonths": [
+                                                    { "yearMonth": "2026-07", "isAvailable": true }
+                                                ]
+                                            }
+                                        ],
+                                        "minSavingsPlanAmount": "25",
+                                        "maxSavingsPlanAmount": "5000",
+                                        "defaultMinSavingsPlanAmount": "25",
+                                        "dynamizationRates": [0],
+                                        "defaultDynamizationRate": 0,
+                                        "paymentMethods": ["REFERENCE_ACCOUNT"],
+                                        "frequencies": ["MONTHLY"]
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }"#,
+            )
+            .create();
+
+        let config = sample_runtime_config();
+        ensure_runtime_dpop_key(&config);
+        let mut session_manager = file_session_manager(&tmp);
+        session_manager
+            .save_active(&StoredSession {
+                env: crate::channel::current_env(),
+                session: sample_session(),
+                dpop_jwk_thumbprint: Some(current_runtime_dpop_thumbprint(&config)),
+                mode: None,
+            })
+            .expect("save session");
+
+        let output = run_broker_command_human(
+            crate::cli::BrokerArgs {
+                command: crate::cli::BrokerCommand::SavingsPlans(
+                    crate::cli::BrokerSavingsPlansArgs {
+                        command: Some(crate::cli::BrokerSavingsPlansCommand::Config(
+                            crate::cli::BrokerSavingsPlanConfigArgs {
+                                portfolio_id: Some("portfolio-1".to_string()),
+                                isin: "US0378331005".to_string(),
+                                json: false,
+                            },
+                        )),
+                        portfolio_id: None,
+                        json: false,
+                    },
+                ),
+            },
+            &config,
+            &mut session_manager,
+        )
+        .expect("human config output");
+
+        match output {
+            HumanBrokerOutput::Text(lines) => {
+                assert!(lines.iter().any(|line| line == "portfolio_id: portfolio-1"));
+                assert!(lines.iter().any(|line| line == "security_name: Apple Inc."));
+                assert!(
+                    lines
+                        .iter()
+                        .any(|line| line == "default_frequency: MONTHLY")
+                );
+            }
+            HumanBrokerOutput::Json(_, _) => panic!("expected text output for human config path"),
+        }
+
+        config_mock.assert();
+    }
+
+    #[test]
+    fn execute_broker_savings_plan_config_maps_missing_configuration_to_unavailable_error() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut server = Server::new();
+        let _channel_guard = TestChannelGuard::for_server(&server);
+        let _cfg_guard = EnvGuard::set("SC_CONFIG_DIR", tmp.path().to_string_lossy().to_string());
+
+        let config_mock = server
+            .mock("POST", "/")
+            .match_header("authorization", expected_authorization_header())
+            .match_body(mockito::Matcher::Regex(
+                "BrokerSavingsPlanConfig".to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{
+                    "data": {
+                        "account": {
+                            "brokerPortfolio": {
+                                "security": {
+                                    "isin": "US0378331005",
+                                    "name": "Apple Inc.",
+                                    "type": "STOCK",
+                                    "savingsPlanConfiguration": null
+                                }
+                            }
+                        }
+                    }
+                }"#,
+            )
+            .create();
+
+        let config = sample_runtime_config();
+        ensure_runtime_dpop_key(&config);
+        let mut session_manager = file_session_manager(&tmp);
+        session_manager
+            .save_active(&StoredSession {
+                env: crate::channel::current_env(),
+                session: sample_session(),
+                dpop_jwk_thumbprint: Some(current_runtime_dpop_thumbprint(&config)),
+                mode: None,
+            })
+            .expect("save session");
+
+        let err = execute_broker_savings_plan_config(
+            crate::cli::BrokerSavingsPlanConfigArgs {
+                portfolio_id: Some("portfolio-1".to_string()),
+                isin: "US0378331005".to_string(),
+                json: true,
+            },
+            &config,
+            &mut session_manager,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("SAVINGS_PLAN_CONFIG_UNAVAILABLE"));
+
+        config_mock.assert();
+    }
+
+    #[test]
     fn render_broker_cash_breakdown_text_uses_public_field_names() {
         let payload = json!({
             "result": {
@@ -2854,6 +4561,67 @@ mod tests {
                 "available_for_derivatives: 160",
             ]
         );
+    }
+
+    #[test]
+    fn render_broker_savings_plan_config_text_summarizes_defaults_and_allowed_values() {
+        let payload = json!({
+            "portfolio_id": "portfolio-1",
+            "result": {
+                "security": {
+                    "isin": "US0378331005",
+                    "name": "Apple Inc.",
+                    "security_type": "STOCK"
+                },
+                "amount_limits": {
+                    "min": "25",
+                    "max": "5000"
+                },
+                "defaults": {
+                    "frequency": "MONTHLY",
+                    "day_of_month": 1,
+                    "year_month": "2026-07",
+                    "dynamization_rate": "0",
+                    "payment_method": "REFERENCE_ACCOUNT"
+                },
+                "frequencies": ["MONTHLY", "QUARTERLY"],
+                "payment_methods": ["REFERENCE_ACCOUNT", "CASH_BALANCE"],
+                "dynamization_rates": ["0", "1.5"],
+                "schedules": [{
+                    "day_of_month": 1,
+                    "is_default": true,
+                    "is_earliest": true,
+                    "available_year_months": ["2026-07", "2026-08"]
+                }]
+            }
+        });
+
+        let lines = render_broker_savings_plan_config_text(&payload);
+
+        assert_eq!(lines[0], "portfolio_id: portfolio-1");
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "security_isin: US0378331005")
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "default_frequency: MONTHLY")
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "frequencies: MONTHLY, QUARTERLY")
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "payment_methods: REFERENCE_ACCOUNT, CASH_BALANCE")
+        );
+        assert!(lines.iter().any(|line| {
+            line == "schedule_1: day_of_month=1 default=true earliest=true available_year_months=2026-07, 2026-08"
+        }));
     }
 
     #[test]

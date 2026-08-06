@@ -1,5 +1,6 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
+use serde_json::{Value, json};
 use std::fs;
 use std::path::Path;
 use tempfile::TempDir;
@@ -84,6 +85,31 @@ fn installation_code_json_returns_the_machine_envelope() {
         ))
         .stdout(predicate::str::contains("\"installation_code\""))
         .stdout(predicate::str::contains("\"display_code\""));
+}
+
+#[test]
+fn installation_code_json_invalid_state_returns_machine_envelope() {
+    let (_tmp, config_dir) = temp_config_dir();
+    fs::write(installation_code_file(Path::new(&config_dir)), "{not-json")
+        .expect("write invalid state");
+
+    let assert = sc_command()
+        .env("SC_CONFIG_DIR", &config_dir)
+        .args(["installation-code", "--json"])
+        .assert()
+        .failure()
+        .code(10);
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("utf8 stdout");
+    let envelope: Value = serde_json::from_str(&stdout).expect("machine json envelope");
+
+    assert_eq!(envelope["ok"], json!(false));
+    assert_eq!(envelope["command"], json!("installation-code"));
+    assert_eq!(
+        envelope["error"]["code"],
+        json!("installation_code_invalid_state")
+    );
+    assert!(assert.get_output().stderr.is_empty());
 }
 
 #[test]

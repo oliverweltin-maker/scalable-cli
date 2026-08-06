@@ -285,6 +285,29 @@ mod tests {
     }
 
     #[test]
+    fn upsert_and_load_confirmation_round_trip_preserves_buy_shares_input() {
+        let _lock = crate::lock_test_env();
+        let (_tmp, config_dir) = temp_config_dir();
+        let _guard = EnvGuard::set("SC_CONFIG_DIR", config_dir);
+
+        let mut confirmation = sample_confirmation("scb1_buy_shares");
+        confirmation.phase1_input.amount = None;
+        confirmation.phase1_input.shares = Some("3".to_string());
+        confirmation.fields.amount = None;
+        confirmation.fields.shares = "3".to_string();
+
+        upsert_confirmation(confirmation, 1_000).expect("save");
+        let loaded = load_confirmation("scb1_buy_shares")
+            .expect("load")
+            .expect("should exist");
+
+        assert_eq!(loaded.phase1_input.amount, None);
+        assert_eq!(loaded.phase1_input.shares.as_deref(), Some("3"));
+        assert_eq!(loaded.fields.amount, None);
+        assert_eq!(loaded.fields.shares, "3");
+    }
+
+    #[test]
     fn mark_confirmation_consumed_sets_timestamp() {
         let _lock = crate::lock_test_env();
         let (_tmp, config_dir) = temp_config_dir();
@@ -409,5 +432,65 @@ mod tests {
             .expect("should exist");
 
         assert!(!loaded.requires_accept_unsuitable);
+    }
+
+    #[test]
+    fn load_confirmation_accepts_legacy_buy_phase1_input_without_shares_field() {
+        let _lock = crate::lock_test_env();
+        let (_tmp, config_dir) = temp_config_dir();
+        let _guard = EnvGuard::set("SC_CONFIG_DIR", config_dir);
+
+        let path = confirmation_file_path().expect("confirmation path");
+        fs::write(
+            &path,
+            r#"{
+  "pending": {
+    "confirmation_id": "scb1_legacy_buy_amount",
+    "intent_checksum": "sum1",
+    "nonce": "nonce1",
+    "created_at_epoch": 1000,
+    "expires_at_epoch": 1500,
+    "consumed_at_epoch": null,
+    "env": "dev",
+    "account_id": "a1",
+    "portfolio_id": "p1",
+    "side": "buy",
+    "order_type": "market",
+    "locale": "en_DE",
+    "venue_override": "MUNC",
+    "warning_version": "v1",
+    "phase1_input": {
+      "side": "buy",
+      "isin": "US0378331005",
+      "amount": "500",
+      "venue": "MUNC",
+      "order_type": "market",
+      "limit_price": null,
+      "stop_price": null
+    },
+    "fields": {
+      "isin": "US0378331005",
+      "amount": "500",
+      "currency": "EUR",
+      "venue": "MUNC",
+      "shares": "2",
+      "entry_total": "1.2",
+      "ongoing_total": "0.4",
+      "exit_total": "0.3",
+      "five_years_total": "5.0"
+    },
+    "snapshot_payload": {"ok": true},
+    "ex_ante_costs": {"entryCosts": {"total": {"amount": "1.2"}}}
+  }
+}"#,
+        )
+        .expect("write legacy store without shares field");
+
+        let loaded = load_confirmation("scb1_legacy_buy_amount")
+            .expect("load")
+            .expect("should exist");
+
+        assert_eq!(loaded.phase1_input.amount.as_deref(), Some("500"));
+        assert_eq!(loaded.phase1_input.shares, None);
     }
 }

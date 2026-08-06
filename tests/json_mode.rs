@@ -1,4 +1,5 @@
 use assert_cmd::Command;
+use predicates::prelude::*;
 use serde_json::{Value, json};
 use std::fs;
 use std::path::Path;
@@ -42,9 +43,16 @@ fn capabilities_returns_machine_json_envelope() {
     assert!(commands.contains(&json!("broker.analytics")));
     assert!(commands.contains(&json!("broker.watchlist.add")));
     assert!(commands.contains(&json!("broker.watchlist.remove")));
+    assert!(commands.contains(&json!("broker.portfolio-groups")));
+    assert!(commands.contains(&json!("broker.portfolio-groups.create")));
+    assert!(commands.contains(&json!("broker.portfolio-groups.update")));
+    assert!(commands.contains(&json!("broker.portfolio-groups.delete")));
+    assert!(commands.contains(&json!("broker.portfolio-groups.assign")));
+    assert!(commands.contains(&json!("broker.portfolio-groups.unassign")));
     assert!(commands.contains(&json!("broker.chart")));
     assert!(commands.contains(&json!("broker.quote")));
     assert!(commands.contains(&json!("broker.price-alerts.remove")));
+    assert!(commands.contains(&json!("broker.savings-plans.config")));
     assert!(commands.contains(&json!("broker.trade.buy")));
     assert!(commands.contains(&json!("broker.trade.sell")));
     assert!(commands.contains(&json!("broker.trade.cancel")));
@@ -76,10 +84,22 @@ fn capabilities_returns_machine_json_envelope() {
     );
     assert!(buy_workflow["phase_1_command_template_json"].is_string());
     assert!(
+        buy_workflow["phase_1_command_template_json_shares"]
+            .as_str()
+            .expect("buy shares phase 1 template")
+            .contains("--shares <SHARES>")
+    );
+    assert!(
         buy_workflow["phase_2_command_template_json"]
             .as_str()
             .expect("phase 2 template")
             .contains("--accept-unsuitable")
+    );
+    assert!(
+        buy_workflow["phase_2_command_template_json_shares"]
+            .as_str()
+            .expect("buy shares phase 2 template")
+            .contains("--shares <SHARES>")
     );
 
     let presentation = &buy_workflow["phase_1_presentation_requirement"];
@@ -175,6 +195,16 @@ fn capabilities_returns_machine_json_envelope() {
     assert!(
         !required_leaf_paths
             .iter()
+            .any(|item| item.as_str() == Some("/result/intent/amount"))
+    );
+    assert!(
+        !required_leaf_paths
+            .iter()
+            .any(|item| item.as_str() == Some("/result/intent/shares"))
+    );
+    assert!(
+        !required_leaf_paths
+            .iter()
             .any(|item| { item.as_str() == Some("/result/appropriateness/status") })
     );
     assert!(
@@ -189,4 +219,98 @@ fn capabilities_returns_machine_json_envelope() {
         buy_workflow["phase_1_presentation_requirement"]["raw_json_only_on_user_request"],
         json!(true)
     );
+}
+
+#[test]
+fn parse_failure_with_json_returns_machine_envelope_for_missing_required_args() {
+    let assert = sc_command()
+        .args(["broker", "context", "select", "--json"])
+        .assert()
+        .failure()
+        .code(10);
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("utf8 stdout");
+    let envelope: Value = serde_json::from_str(&stdout).expect("machine json envelope");
+
+    assert_eq!(envelope["ok"], json!(false));
+    assert_eq!(envelope["command"], json!("broker.context.select"));
+    assert_eq!(envelope["error"]["code"], json!("invalid_input"));
+    assert_eq!(
+        envelope["hints"],
+        json!(["Check command arguments and input values."])
+    );
+    assert!(assert.get_output().stderr.is_empty());
+    assert!(
+        envelope["error"]["message"]
+            .as_str()
+            .expect("error message")
+            .contains("required arguments")
+    );
+}
+
+#[test]
+fn parse_failure_with_json_returns_machine_envelope_for_invalid_subcommand() {
+    let assert = sc_command()
+        .args(["broker", "bogus", "--json"])
+        .assert()
+        .failure()
+        .code(10);
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("utf8 stdout");
+    let envelope: Value = serde_json::from_str(&stdout).expect("machine json envelope");
+
+    assert_eq!(envelope["ok"], json!(false));
+    assert_eq!(envelope["command"], json!("broker"));
+    assert_eq!(envelope["error"]["code"], json!("invalid_input"));
+    assert_eq!(
+        envelope["hints"],
+        json!(["Check command arguments and input values."])
+    );
+    assert!(assert.get_output().stderr.is_empty());
+    assert!(
+        envelope["error"]["message"]
+            .as_str()
+            .expect("error message")
+            .contains("unrecognized subcommand")
+    );
+}
+
+#[test]
+fn parse_failure_with_invalid_value_preserves_leaf_command_name() {
+    let assert = sc_command()
+        .args([
+            "broker",
+            "chart",
+            "--isin",
+            "US0378331005",
+            "--timeframe",
+            "nope",
+            "--json",
+        ])
+        .assert()
+        .failure()
+        .code(10);
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("utf8 stdout");
+    let envelope: Value = serde_json::from_str(&stdout).expect("machine json envelope");
+
+    assert_eq!(envelope["ok"], json!(false));
+    assert_eq!(envelope["command"], json!("broker.chart"));
+    assert_eq!(envelope["error"]["code"], json!("invalid_input"));
+    assert_eq!(
+        envelope["hints"],
+        json!(["Check command arguments and input values."])
+    );
+    assert!(assert.get_output().stderr.is_empty());
+}
+
+#[test]
+fn unsupported_json_flag_on_login_stays_human_facing() {
+    sc_command()
+        .args(["login", "--json"])
+        .assert()
+        .failure()
+        .code(2)
+        .stdout("")
+        .stderr(predicate::str::contains("unexpected argument '--json'"));
 }

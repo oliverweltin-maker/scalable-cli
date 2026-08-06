@@ -6,7 +6,7 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
 #[cfg(target_os = "macos")]
-use super::{DpopPublicJwk, der_signature_to_raw_ecdsa};
+use super::{DpopPublicJwk, der_signature_to_raw_ecdsa, map_secure_enclave_signing_error};
 
 #[cfg(target_os = "macos")]
 const DPOP_SECURE_ENCLAVE_LABEL: &str = "scalable.capital:scalable-cli:auth-signing-key:v2";
@@ -119,7 +119,9 @@ impl SecureEnclaveKey {
         let der_signature = self
             .private_key
             .create_signature(Algorithm::ECDSASignatureMessageX962SHA256, signing_input)
-            .map_err(|err| anyhow!("Failed signing DPoP proof with Secure Enclave key: {err}"))?;
+            .map_err(|err| {
+                map_secure_enclave_signing_error(i64::try_from(err.code()).unwrap_or_default(), err)
+            })?;
 
         der_signature_to_raw_ecdsa(&der_signature)
     }

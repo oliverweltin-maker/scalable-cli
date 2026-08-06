@@ -5,20 +5,22 @@ use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::active_session::load_active_session;
-use crate::broker_shared::{checksum_for_payload, resolve_broker_ids};
+use crate::broker_shared::resolve_broker_ids;
 use crate::config::{AppConfig, TargetEnv};
 use crate::graphql::{LOCAL_READ_ONLY_ERROR_PREFIX, execute_graphql, execute_graphql_with_headers};
+use crate::payload_fingerprint::checksum_for_payload;
 use crate::resolve_active_env;
 use crate::session::SessionManager;
 use crate::session_refresh::execute_with_refresh_retry;
 use crate::trade::{
-    PlaceOrderFields, SecurityTick, SingleExAnteFields, TRADE_APPROPRIATENESS_WARNING_QUERY,
-    TRADE_CANCEL_ORDER_MUTATION, TRADE_PLACE_ORDER_MUTATION, TRADE_SECURITY_TICK_QUERY,
-    TRADE_SINGLE_EX_ANTE_COSTS_QUERY, TRADE_TRADABILITY_QUERY, TradeComplianceDecision, TradeSide,
-    TradeTradabilityGate, evaluate_trade_compliance, extract_single_trade_ex_ante_costs,
-    market_buy_shares_from_amount, parse_appropriateness_warning, parse_cancel_order_result,
-    parse_place_order_result, parse_security_issuer_document_links, parse_security_tick,
-    parse_tradability_gate, required_non_empty, round_estimated_order_volume_for_ex_ante,
+    NumberOfShares, PlaceOrderFields, SecurityTick, SingleExAnteFields,
+    TRADE_APPROPRIATENESS_WARNING_QUERY, TRADE_CANCEL_ORDER_MUTATION, TRADE_PLACE_ORDER_MUTATION,
+    TRADE_SECURITY_TICK_QUERY, TRADE_SINGLE_EX_ANTE_COSTS_QUERY, TRADE_TRADABILITY_QUERY,
+    TradeComplianceDecision, TradeSide, TradeTradabilityGate, evaluate_trade_compliance,
+    extract_single_trade_ex_ante_costs, market_buy_shares_from_amount,
+    parse_appropriateness_warning, parse_cancel_order_result, parse_place_order_result,
+    parse_security_issuer_document_links, parse_security_tick, parse_tradability_gate,
+    required_non_empty, round_estimated_order_volume_for_ex_ante,
     trade_appropriateness_warning_variables, trade_cancel_order_variables,
     trade_estimated_order_price, trade_place_order_variables, trade_security_tick_variables,
     trade_side_quote_price, trade_single_ex_ante_variables, trade_tradability_variables,
@@ -67,7 +69,7 @@ pub(crate) struct TradeIntent {
     pub(crate) isin: String,
     pub(crate) amount: Option<f64>,
     pub(crate) amount_str: Option<String>,
-    pub(crate) shares: Option<f64>,
+    pub(crate) shares: Option<NumberOfShares>,
     pub(crate) shares_str: Option<String>,
     pub(crate) order_type: String,
     pub(crate) limit_price: Option<f64>,
@@ -106,7 +108,7 @@ pub(crate) struct PreparedTrade {
     pub(crate) sizing_price: String,
     pub(crate) estimate_price_basis: &'static str,
     pub(crate) estimate_price: String,
-    pub(crate) number_of_shares: f64,
+    pub(crate) number_of_shares: NumberOfShares,
     pub(crate) number_of_shares_str: String,
     pub(crate) is_whole_position_sold: bool,
     pub(crate) estimated_order_volume_raw: f64,
@@ -126,15 +128,80 @@ impl TradeIntent {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct ParsedNumericInput {
+    raw: String,
+    normalized: String,
+    value: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedWholeSharesInput {
+    raw: String,
+    normalized: String,
+    value: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum TradeSizingInput {
+    Amount(ParsedNumericInput),
+    WholeShares(ParsedWholeSharesInput),
+    DecimalShares(ParsedNumericInput),
+}
+
+impl TradeSizingInput {
+    fn amount_raw(&self) -> Option<&str> {
+        match self {
+            Self::Amount(input) => Some(input.raw.as_str()),
+            Self::WholeShares(_) | Self::DecimalShares(_) => None,
+        }
+    }
+
+    fn shares_raw(&self) -> Option<&str> {
+        match self {
+            Self::Amount(_) => None,
+            Self::WholeShares(input) => Some(input.raw.as_str()),
+            Self::DecimalShares(input) => Some(input.raw.as_str()),
+        }
+    }
+
+    fn amount_normalized(&self) -> Option<&str> {
+        match self {
+            Self::Amount(input) => Some(input.normalized.as_str()),
+            Self::WholeShares(_) | Self::DecimalShares(_) => None,
+        }
+    }
+
+    fn shares_normalized(&self) -> Option<&str> {
+        match self {
+            Self::Amount(_) => None,
+            Self::WholeShares(input) => Some(input.normalized.as_str()),
+            Self::DecimalShares(input) => Some(input.normalized.as_str()),
+        }
+    }
+
+    fn amount_value(&self) -> Option<f64> {
+        match self {
+            Self::Amount(input) => Some(input.value),
+            Self::WholeShares(_) | Self::DecimalShares(_) => None,
+        }
+    }
+
+    fn shares_value(&self) -> Option<NumberOfShares> {
+        match self {
+            Self::Amount(_) => None,
+            Self::WholeShares(input) => Some(NumberOfShares::Whole(input.value)),
+            Self::DecimalShares(input) => Some(NumberOfShares::Decimal(input.value)),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Phase2Input {
     confirmation_id: String,
     accept_unsuitable: bool,
     isin: String,
-    amount: Option<String>,
-    amount_value: Option<f64>,
-    shares: Option<String>,
-    shares_value: Option<f64>,
+    sizing: TradeSizingInput,
     venue: Option<String>,
     order_type: String,
     limit_price: Option<String>,
@@ -151,13 +218,25 @@ struct ValidatedOrderPrices {
     stop_price_value: Option<f64>,
 }
 
+struct TradeIntentBuildInput<'a> {
+    side: TradeSide,
+    isin: &'a str,
+    sizing: &'a TradeSizingInput,
+    order_type: &'a str,
+    limit_price: &'a Option<String>,
+    limit_price_value: Option<f64>,
+    stop_price: &'a Option<String>,
+    stop_price_value: Option<f64>,
+    venue: Option<&'a str>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct TradeCalculation {
     sizing_price_basis: &'static str,
     sizing_price_value: f64,
     estimate_price_basis: &'static str,
     estimate_price_value: f64,
-    number_of_shares: f64,
+    number_of_shares: NumberOfShares,
     number_of_shares_str: String,
     is_whole_position_sold: bool,
     estimated_order_volume_raw: f64,
@@ -249,8 +328,7 @@ fn execute_trade_buy_phase1(
     config: &AppConfig,
     session_manager: &mut SessionManager,
 ) -> Result<Value> {
-    let phase1_input = parse_phase1_input_for_confirmation_buy(&args)?;
-    let intent = parse_phase1_intent_buy(&args)?;
+    let (phase1_input, intent) = parse_phase1_buy(&args)?;
     execute_trade_phase1(
         TradeSide::Buy,
         phase1_input,
@@ -524,6 +602,13 @@ fn ensure_phase2_snapshot_matches(
     stored: &TradeConfirmation,
 ) -> Result<()> {
     if prepared.confirmation_fields != stored.fields {
+        if let Some((field, phase1_value, fresh_value)) =
+            first_confirmation_field_difference(&stored.fields, &prepared.confirmation_fields)
+        {
+            bail!(
+                "CONFIRMATION_FIELDS_MISMATCH: confirmation field '{field}' changed from phase 1 value '{phase1_value}' to fresh value '{fresh_value}'; rerun phase 1"
+            );
+        }
         bail!(
             "CONFIRMATION_FIELDS_MISMATCH: fresh pre-trade values differ from phase 1 snapshot; rerun phase 1"
         );
@@ -552,6 +637,40 @@ fn ensure_phase2_snapshot_matches(
     }
 
     Ok(())
+}
+
+fn first_confirmation_field_difference(
+    phase1: &ConfirmationFields,
+    fresh: &ConfirmationFields,
+) -> Option<(&'static str, String, String)> {
+    macro_rules! first_difference {
+        ($field:ident) => {
+            if phase1.$field != fresh.$field {
+                return Some((
+                    stringify!($field),
+                    phase1.$field.to_string(),
+                    fresh.$field.to_string(),
+                ));
+            }
+        };
+    }
+
+    first_difference!(isin);
+    if phase1.amount != fresh.amount {
+        return Some((
+            "amount",
+            phase1.amount.as_deref().unwrap_or("null").to_string(),
+            fresh.amount.as_deref().unwrap_or("null").to_string(),
+        ));
+    }
+    first_difference!(currency);
+    first_difference!(venue);
+    first_difference!(shares);
+    first_difference!(entry_total);
+    first_difference!(ongoing_total);
+    first_difference!(exit_total);
+    first_difference!(five_years_total);
+    None
 }
 
 fn ensure_phase2_submission_requirements(
@@ -610,54 +729,22 @@ fn build_phase2_intent(
     phase2: &Phase2Input,
     _phase1: &ConfirmationPhase1Input,
 ) -> Result<TradeIntent> {
-    Ok(TradeIntent {
+    build_trade_intent(TradeIntentBuildInput {
         side,
-        isin: canonical_isin(&phase2.isin, "isin")?,
-        amount: phase2.amount_value,
-        amount_str: phase2.amount.clone(),
-        shares: phase2.shares_value,
-        shares_str: phase2.shares.clone(),
-        order_type: phase2.order_type.clone(),
-        limit_price: phase2.limit_price_value,
-        stop_price: phase2.stop_price_value,
-        limit_price_str: phase2.limit_price.clone(),
-        stop_price_str: phase2.stop_price.clone(),
-        venue_override: phase2.venue.as_deref().map(str::to_uppercase),
-        locale: TRADE_WARNING_LOCALE.to_string(),
+        isin: &phase2.isin,
+        sizing: &phase2.sizing,
+        order_type: &phase2.order_type,
+        limit_price: &phase2.limit_price,
+        limit_price_value: phase2.limit_price_value,
+        stop_price: &phase2.stop_price,
+        stop_price_value: phase2.stop_price_value,
+        venue: phase2.venue.as_deref(),
     })
 }
 
+#[cfg(test)]
 fn parse_phase1_intent_buy(args: &crate::cli::BrokerTradeBuyArgs) -> Result<TradeIntent> {
-    let isin = canonical_isin(required_input_value(args.isin.as_deref(), "isin")?, "isin")?;
-    let amount_raw = required_input_value(args.amount.as_deref(), "amount")?;
-    let (amount, amount_str) = parse_positive_decimal_from_str(amount_raw, "amount")?;
-    let prices = validate_order_price_flags(
-        args.order_type,
-        args.limit_price.as_deref(),
-        args.stop_price.as_deref(),
-    )?;
-
-    let venue_override = args
-        .venue
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| value.to_uppercase());
-    Ok(TradeIntent {
-        side: TradeSide::Buy,
-        isin,
-        amount: Some(amount),
-        amount_str: Some(amount_str),
-        shares: None,
-        shares_str: None,
-        order_type: order_type_label(args.order_type).to_string(),
-        limit_price: prices.limit_price_value,
-        stop_price: prices.stop_price_value,
-        limit_price_str: prices.limit_price,
-        stop_price_str: prices.stop_price,
-        venue_override,
-        locale: TRADE_WARNING_LOCALE.to_string(),
-    })
+    parse_phase1_buy(args).map(|(_, intent)| intent)
 }
 
 fn parse_phase1_intent_sell(args: &crate::cli::BrokerTradeSellArgs) -> Result<TradeIntent> {
@@ -681,7 +768,7 @@ fn parse_phase1_intent_sell(args: &crate::cli::BrokerTradeSellArgs) -> Result<Tr
         isin,
         amount: None,
         amount_str: None,
-        shares: Some(shares),
+        shares: Some(NumberOfShares::Decimal(shares)),
         shares_str: Some(shares_str),
         order_type: order_type_label(args.order_type).to_string(),
         limit_price: prices.limit_price_value,
@@ -693,59 +780,72 @@ fn parse_phase1_intent_sell(args: &crate::cli::BrokerTradeSellArgs) -> Result<Tr
     })
 }
 
+#[cfg(test)]
 fn parse_phase1_input_for_confirmation_buy(
     args: &crate::cli::BrokerTradeBuyArgs,
 ) -> Result<ConfirmationPhase1Input> {
+    parse_phase1_buy(args).map(|(phase1_input, _)| phase1_input)
+}
+
+fn parse_phase1_buy(
+    args: &crate::cli::BrokerTradeBuyArgs,
+) -> Result<(ConfirmationPhase1Input, TradeIntent)> {
     let isin = required_input_value(args.isin.as_deref(), "isin")?.to_string();
-    let amount = required_input_value(args.amount.as_deref(), "amount")?.to_string();
-    let _ = parse_positive_decimal_from_str(&amount, "amount")?;
+    let sizing = parse_buy_sizing_input(args.amount.as_deref(), args.shares.as_deref())?;
     let prices = validate_order_price_flags(
         args.order_type,
         args.limit_price.as_deref(),
         args.stop_price.as_deref(),
     )?;
+    let order_type = order_type_label(args.order_type).to_string();
+    let phase1_input = build_confirmation_phase1_input(
+        ORDER_SIDE_BUY,
+        &isin,
+        &sizing,
+        &order_type,
+        &prices,
+        args.venue.as_deref(),
+    );
+    let intent = build_trade_intent(TradeIntentBuildInput {
+        side: TradeSide::Buy,
+        isin: &isin,
+        sizing: &sizing,
+        order_type: &order_type,
+        limit_price: &prices.limit_price,
+        limit_price_value: prices.limit_price_value,
+        stop_price: &prices.stop_price,
+        stop_price_value: prices.stop_price_value,
+        venue: args.venue.as_deref(),
+    })?;
 
-    Ok(ConfirmationPhase1Input {
-        side: ORDER_SIDE_BUY.to_string(),
-        isin,
-        amount: Some(amount),
-        shares: None,
-        venue: optional_trimmed_string(args.venue.as_deref()),
-        order_type: order_type_label(args.order_type).to_string(),
-        limit_price: prices.limit_price,
-        stop_price: prices.stop_price,
-    })
+    Ok((phase1_input, intent))
 }
 
 fn parse_phase1_input_for_confirmation_sell(
     args: &crate::cli::BrokerTradeSellArgs,
 ) -> Result<ConfirmationPhase1Input> {
     let isin = required_input_value(args.isin.as_deref(), "isin")?.to_string();
-    let shares = required_input_value(args.shares.as_deref(), "shares")?.to_string();
-    let _ = parse_positive_decimal_from_str(&shares, "shares")?;
+    let sizing = parse_sell_sizing_input(args.shares.as_deref())?;
     let prices = validate_order_price_flags(
         args.order_type,
         args.limit_price.as_deref(),
         args.stop_price.as_deref(),
     )?;
 
-    Ok(ConfirmationPhase1Input {
-        side: ORDER_SIDE_SELL.to_string(),
-        isin,
-        amount: None,
-        shares: Some(shares),
-        venue: optional_trimmed_string(args.venue.as_deref()),
-        order_type: order_type_label(args.order_type).to_string(),
-        limit_price: prices.limit_price,
-        stop_price: prices.stop_price,
-    })
+    Ok(build_confirmation_phase1_input(
+        ORDER_SIDE_SELL,
+        &isin,
+        &sizing,
+        order_type_label(args.order_type),
+        &prices,
+        args.venue.as_deref(),
+    ))
 }
 
 fn parse_phase2_input_buy(args: &crate::cli::BrokerTradeBuyArgs) -> Result<Phase2Input> {
     let confirmation_id = required_flag_value(args.confirm.as_deref(), "--confirm")?.to_string();
     let isin = required_input_value(args.isin.as_deref(), "isin")?.to_string();
-    let amount = required_input_value(args.amount.as_deref(), "amount")?.to_string();
-    let amount_value = parse_positive_decimal_from_str(&amount, "amount")?.0;
+    let sizing = parse_buy_sizing_input(args.amount.as_deref(), args.shares.as_deref())?;
     let prices = validate_order_price_flags(
         args.order_type,
         args.limit_price.as_deref(),
@@ -758,10 +858,7 @@ fn parse_phase2_input_buy(args: &crate::cli::BrokerTradeBuyArgs) -> Result<Phase
         confirmation_id,
         accept_unsuitable: args.accept_unsuitable,
         isin,
-        amount: Some(amount),
-        amount_value: Some(amount_value),
-        shares: None,
-        shares_value: None,
+        sizing,
         venue,
         order_type,
         limit_price: prices.limit_price,
@@ -774,8 +871,7 @@ fn parse_phase2_input_buy(args: &crate::cli::BrokerTradeBuyArgs) -> Result<Phase
 fn parse_phase2_input_sell(args: &crate::cli::BrokerTradeSellArgs) -> Result<Phase2Input> {
     let confirmation_id = required_flag_value(args.confirm.as_deref(), "--confirm")?.to_string();
     let isin = required_input_value(args.isin.as_deref(), "isin")?.to_string();
-    let shares = required_input_value(args.shares.as_deref(), "shares")?.to_string();
-    let shares_value = parse_positive_decimal_from_str(&shares, "shares")?.0;
+    let sizing = parse_sell_sizing_input(args.shares.as_deref())?;
     let prices = validate_order_price_flags(
         args.order_type,
         args.limit_price.as_deref(),
@@ -788,16 +884,112 @@ fn parse_phase2_input_sell(args: &crate::cli::BrokerTradeSellArgs) -> Result<Pha
         confirmation_id,
         accept_unsuitable: false,
         isin,
-        amount: None,
-        amount_value: None,
-        shares: Some(shares),
-        shares_value: Some(shares_value),
+        sizing,
         venue,
         order_type,
         limit_price: prices.limit_price,
         stop_price: prices.stop_price,
         limit_price_value: prices.limit_price_value,
         stop_price_value: prices.stop_price_value,
+    })
+}
+
+fn parse_buy_sizing_input(
+    amount_raw: Option<&str>,
+    shares_raw: Option<&str>,
+) -> Result<TradeSizingInput> {
+    match (
+        optional_trimmed_string(amount_raw),
+        optional_trimmed_string(shares_raw),
+    ) {
+        (Some(amount), None) => Ok(TradeSizingInput::Amount(parse_positive_numeric_input(
+            &amount, "amount",
+        )?)),
+        (None, Some(shares)) => Ok(TradeSizingInput::WholeShares(
+            parse_positive_whole_shares_input(&shares, "shares")?,
+        )),
+        _ => bail!("Trade input invalid: buy requires exactly one of --amount or --shares"),
+    }
+}
+
+fn parse_sell_sizing_input(shares_raw: Option<&str>) -> Result<TradeSizingInput> {
+    let shares = required_input_value(shares_raw, "shares")?;
+    Ok(TradeSizingInput::DecimalShares(
+        parse_positive_numeric_input(shares, "shares")?,
+    ))
+}
+
+fn parse_positive_numeric_input(raw: &str, field: &str) -> Result<ParsedNumericInput> {
+    let raw = required_input_value(Some(raw), field)?.to_string();
+    let (value, normalized) = parse_positive_decimal_from_str(&raw, field)?;
+    Ok(ParsedNumericInput {
+        raw,
+        normalized,
+        value,
+    })
+}
+
+fn parse_positive_whole_shares_input(raw: &str, field: &str) -> Result<ParsedWholeSharesInput> {
+    let raw = required_input_value(Some(raw), field)?.to_string();
+    let normalized = normalize_decimal_str(&raw);
+    let value = normalized.parse::<u64>().map_err(|_| {
+        anyhow!(
+            "Trade input invalid: field '{}' must be a positive whole number",
+            field
+        )
+    })?;
+    if value == 0 {
+        bail!(
+            "Trade input invalid: field '{}' must be a positive whole number",
+            field
+        );
+    }
+    Ok(ParsedWholeSharesInput {
+        raw,
+        normalized,
+        value,
+    })
+}
+
+fn build_confirmation_phase1_input(
+    side: &str,
+    isin: &str,
+    sizing: &TradeSizingInput,
+    order_type: &str,
+    prices: &ValidatedOrderPrices,
+    venue: Option<&str>,
+) -> ConfirmationPhase1Input {
+    ConfirmationPhase1Input {
+        side: side.to_string(),
+        isin: isin.to_string(),
+        amount: sizing.amount_raw().map(ToString::to_string),
+        shares: sizing.shares_raw().map(ToString::to_string),
+        venue: optional_trimmed_string(venue),
+        order_type: order_type.to_string(),
+        limit_price: prices.limit_price.clone(),
+        stop_price: prices.stop_price.clone(),
+    }
+}
+
+fn build_trade_intent(input: TradeIntentBuildInput<'_>) -> Result<TradeIntent> {
+    Ok(TradeIntent {
+        side: input.side,
+        isin: canonical_isin(input.isin, "isin")?,
+        amount: input.sizing.amount_value(),
+        amount_str: input.sizing.amount_normalized().map(ToString::to_string),
+        shares: input.sizing.shares_value(),
+        shares_str: input.sizing.shares_normalized().map(ToString::to_string),
+        order_type: input.order_type.to_string(),
+        limit_price: input.limit_price_value,
+        stop_price: input.stop_price_value,
+        limit_price_str: input.limit_price.clone(),
+        stop_price_str: input.stop_price.clone(),
+        venue_override: input
+            .venue
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_uppercase),
+        locale: TRADE_WARNING_LOCALE.to_string(),
     })
 }
 
@@ -824,10 +1016,10 @@ fn assert_phase2_matches_phase1_input(
     if phase2.isin != phase1.isin {
         bail!("CONFIRMATION_FIELDS_MISMATCH: --isin does not match phase 1 input");
     }
-    if phase2.amount != phase1.amount {
+    if phase2.sizing.amount_raw().map(str::to_string) != phase1.amount {
         bail!("CONFIRMATION_FIELDS_MISMATCH: --amount does not match phase 1 input");
     }
-    if phase2.shares != phase1.shares {
+    if phase2.sizing.shares_raw().map(str::to_string) != phase1.shares {
         bail!("CONFIRMATION_FIELDS_MISMATCH: --shares does not match phase 1 input");
     }
     if phase2.venue != phase1.venue {
@@ -1173,26 +1365,54 @@ fn calculate_trade_quantities(
 
     let (number_of_shares, number_of_shares_str, is_whole_position_sold) = match intent.side {
         TradeSide::Buy => {
-            let amount = intent.amount.ok_or_else(|| {
-                anyhow!("Trade input invalid: field 'amount' must be present for buy flow")
-            })?;
-            let amount_str = intent.amount_str.as_deref().unwrap_or(VALUE_NA);
-            let shares_u64 = market_buy_shares_from_amount(amount, sizing_price.price, false);
-            if shares_u64 == 0 {
-                bail!(
-                    "EX_ANTE_COST_UNAVAILABLE: amount {} {} is below one share at current {} {}",
-                    amount_str,
-                    quote.currency,
-                    pricing_basis_display_name(sizing_price.basis),
-                    canonical_decimal_from_f64(sizing_price.price)
-                );
+            if let Some(amount) = intent.amount {
+                let amount_str = intent.amount_str.as_deref().unwrap_or(VALUE_NA);
+                let shares_u64 = market_buy_shares_from_amount(amount, sizing_price.price, false);
+                if shares_u64 == 0 {
+                    bail!(
+                        "EX_ANTE_COST_UNAVAILABLE: amount {} {} is below one share at current {} {}",
+                        amount_str,
+                        quote.currency,
+                        pricing_basis_display_name(sizing_price.basis),
+                        canonical_decimal_from_f64(sizing_price.price)
+                    );
+                }
+                (
+                    NumberOfShares::Whole(shares_u64),
+                    shares_u64.to_string(),
+                    false,
+                )
+            } else {
+                let shares = intent.shares.ok_or_else(|| {
+                    anyhow!(
+                        "Trade input invalid: exactly one of 'amount' or 'shares' must be present for buy flow"
+                    )
+                })?;
+                match shares {
+                    NumberOfShares::Whole(value) => (
+                        NumberOfShares::Whole(value),
+                        intent
+                            .shares_str
+                            .clone()
+                            .unwrap_or_else(|| value.to_string()),
+                        false,
+                    ),
+                    NumberOfShares::Decimal(_) => bail!(
+                        "Trade input invalid: buy flow requires whole-share quantity when sized by shares"
+                    ),
+                }
             }
-            (shares_u64 as f64, shares_u64.to_string(), false)
         }
         TradeSide::Sell => {
             let shares = intent.shares.ok_or_else(|| {
                 anyhow!("Trade input invalid: field 'shares' must be present for sell flow")
             })?;
+            let shares = match shares {
+                NumberOfShares::Decimal(value) => value,
+                NumberOfShares::Whole(_) => {
+                    bail!("Trade input invalid: sell flow requires decimal share quantity")
+                }
+            };
             resolve_sell_trade_shares(
                 shares,
                 intent.shares_str.as_deref(),
@@ -1202,7 +1422,7 @@ fn calculate_trade_quantities(
         }
     };
 
-    let estimated_order_volume_raw = number_of_shares * estimate_price.price;
+    let estimated_order_volume_raw = number_of_shares.as_f64() * estimate_price.price;
     let estimated_order_volume =
         round_estimated_order_volume_for_ex_ante(estimated_order_volume_raw);
     if estimated_order_volume <= 0.0 {
@@ -1449,7 +1669,7 @@ fn resolve_sell_trade_shares(
     requested_shares_str: Option<&str>,
     selected_venue: &str,
     selected_venue_sellable: Option<f64>,
-) -> Result<(f64, String, bool)> {
+) -> Result<(NumberOfShares, String, bool)> {
     let sellable = selected_venue_sellable.ok_or_else(|| {
         anyhow!(
             "Trade response invalid: missing sellable quantity for selected venue '{}'",
@@ -1466,7 +1686,7 @@ fn resolve_sell_trade_shares(
     }
     let whole = decimal_equal(requested_shares, sellable);
     Ok((
-        requested_shares,
+        NumberOfShares::Decimal(requested_shares),
         requested_shares_str
             .map(ToString::to_string)
             .unwrap_or_else(|| canonical_decimal_from_f64(requested_shares)),
@@ -3015,8 +3235,8 @@ mod tests {
                 isin: "DE0007100000".to_string(),
                 amount: Some(500.0),
                 amount_str: Some("500".to_string()),
-                shares: Some(9.0),
-                shares_str: Some("9".to_string()),
+                shares: None,
+                shares_str: None,
                 order_type: ORDER_TYPE_LIMIT.to_string(),
                 limit_price: Some(48.5),
                 stop_price: None,
@@ -3060,7 +3280,7 @@ mod tests {
             sizing_price: "50.5000".to_string(),
             estimate_price_basis: "limit_price",
             estimate_price: "48.5000".to_string(),
-            number_of_shares: 9.0,
+            number_of_shares: NumberOfShares::Whole(9),
             number_of_shares_str: "9".to_string(),
             is_whole_position_sold: false,
             estimated_order_volume_raw: 454.1049,
@@ -3155,10 +3375,52 @@ mod tests {
         assert_eq!(calculation.sizing_price_value, 50.5);
         assert_eq!(calculation.estimate_price_basis, "limit_price");
         assert_eq!(calculation.estimate_price_value, 48.5);
-        assert_eq!(calculation.number_of_shares, 9.0);
+        assert_eq!(calculation.number_of_shares, NumberOfShares::Whole(9));
         assert_eq!(calculation.number_of_shares_str, "9");
         assert_eq!(calculation.estimated_order_volume_raw, 436.5);
         assert_eq!(calculation.estimated_order_volume, 436.5);
+    }
+
+    #[test]
+    fn calculate_trade_quantities_uses_requested_buy_shares_directly() {
+        let intent = TradeIntent {
+            side: TradeSide::Buy,
+            isin: "DE0007100000".to_string(),
+            amount: None,
+            amount_str: None,
+            shares: Some(NumberOfShares::Whole(3)),
+            shares_str: Some("3".to_string()),
+            order_type: ORDER_TYPE_MARKET.to_string(),
+            limit_price: None,
+            stop_price: None,
+            limit_price_str: None,
+            stop_price_str: None,
+            venue_override: None,
+            locale: "en_DE".to_string(),
+        };
+        let quote = SecurityTick {
+            ask_price: Some(50.5),
+            bid_price: Some(50.4),
+            mid_price: 50.4561,
+            currency: "EUR".to_string(),
+            is_outdated: false,
+            timestamp_utc: None,
+        };
+
+        let calculation = calculate_trade_quantities(
+            &intent,
+            &quote,
+            &sample_tradability_gate_for_calculation(TradeSide::Buy),
+        )
+        .expect("share-sized buy calculation should succeed");
+
+        assert_eq!(calculation.sizing_price_basis, "ask_price");
+        assert_eq!(calculation.estimate_price_basis, "ask_price");
+        assert_eq!(calculation.number_of_shares, NumberOfShares::Whole(3));
+        assert_eq!(calculation.number_of_shares_str, "3");
+        assert_eq!(calculation.estimated_order_volume_raw, 151.5);
+        assert_eq!(calculation.estimated_order_volume, 151.5);
+        assert!(!calculation.is_whole_position_sold);
     }
 
     #[test]
@@ -3168,7 +3430,7 @@ mod tests {
             isin: "DE0007100000".to_string(),
             amount: None,
             amount_str: None,
-            shares: Some(5.0),
+            shares: Some(NumberOfShares::Decimal(5.0)),
             shares_str: Some("5".to_string()),
             order_type: ORDER_TYPE_STOP.to_string(),
             limit_price: None,
@@ -3196,7 +3458,7 @@ mod tests {
 
         assert_eq!(calculation.sizing_price_basis, "bid_price");
         assert_eq!(calculation.estimate_price_basis, "stop_price");
-        assert_eq!(calculation.number_of_shares, 5.0);
+        assert_eq!(calculation.number_of_shares, NumberOfShares::Decimal(5.0));
         assert!(calculation.is_whole_position_sold);
         assert_eq!(calculation.estimated_order_volume_raw, 240.0);
         assert_eq!(calculation.estimated_order_volume, 240.0);
@@ -3209,7 +3471,7 @@ mod tests {
             isin: "DE0007100000".to_string(),
             amount: None,
             amount_str: None,
-            shares: Some(5.0),
+            shares: Some(NumberOfShares::Decimal(5.0)),
             shares_str: Some("5".to_string()),
             order_type: ORDER_TYPE_MARKET.to_string(),
             limit_price: None,
@@ -3287,6 +3549,20 @@ mod tests {
             err.to_string()
                 .contains("fresh ex-ante costs differ from phase 1 snapshot")
         );
+    }
+
+    #[test]
+    fn phase2_snapshot_check_reports_changed_confirmation_field_values() {
+        let mut prepared = sample_prepared_trade_for_phase2_validation();
+        let stored = sample_trade_confirmation_for_phase2_validation(&prepared);
+        prepared.confirmation_fields.amount = Some("250.2".to_string());
+
+        let err = ensure_phase2_snapshot_matches(&prepared, &stored)
+            .expect_err("changed amount should fail the snapshot check");
+
+        assert!(err.to_string().contains(
+            "confirmation field 'amount' changed from phase 1 value '500' to fresh value '250.2'"
+        ));
     }
 
     #[test]
@@ -3381,10 +3657,11 @@ mod tests {
             confirmation_id: "scb1_test".to_string(),
             accept_unsuitable: false,
             isin: "DE0007100000".to_string(),
-            amount: Some("500".to_string()),
-            amount_value: Some(500.0),
-            shares: None,
-            shares_value: None,
+            sizing: TradeSizingInput::Amount(ParsedNumericInput {
+                raw: "500".to_string(),
+                normalized: "500".to_string(),
+                value: 500.0,
+            }),
             venue: None,
             order_type: ORDER_TYPE_MARKET.to_string(),
             limit_price: None,
@@ -3413,10 +3690,11 @@ mod tests {
             confirmation_id: "scb1_test".to_string(),
             accept_unsuitable: false,
             isin: "de0007100000".to_string(),
-            amount: Some("500.00".to_string()),
-            amount_value: Some(500.0),
-            shares: None,
-            shares_value: None,
+            sizing: TradeSizingInput::Amount(ParsedNumericInput {
+                raw: "500.00".to_string(),
+                normalized: "500".to_string(),
+                value: 500.0,
+            }),
             venue: Some(" gettex ".to_string()),
             order_type: ORDER_TYPE_MARKET.to_string(),
             limit_price: None,
@@ -3439,9 +3717,94 @@ mod tests {
             build_phase2_intent(TradeSide::Buy, &phase2, &phase1).expect("intent should build");
 
         assert_eq!(intent.isin, "DE0007100000");
-        assert_eq!(intent.amount_str.as_deref(), Some("500.00"));
-        assert_eq!(intent.venue_override.as_deref(), Some(" GETTEX "));
+        assert_eq!(intent.amount_str.as_deref(), Some("500"));
+        assert_eq!(intent.venue_override.as_deref(), Some("GETTEX"));
         assert_eq!(intent.locale, TRADE_WARNING_LOCALE);
+    }
+
+    #[test]
+    fn phase1_and_phase2_normalize_trailing_zero_amounts_identically() {
+        let phase1_args = crate::cli::BrokerTradeBuyArgs {
+            isin: Some("DE0007100000".to_string()),
+            amount: Some("250.20".to_string()),
+            shares: None,
+            order_type: crate::cli::BrokerTradeOrderType::Limit,
+            limit_price: Some("12.50".to_string()),
+            stop_price: None,
+            venue: None,
+            confirm: None,
+            accept_unsuitable: false,
+            json: true,
+        };
+        let phase2_args = crate::cli::BrokerTradeBuyArgs {
+            isin: Some("DE0007100000".to_string()),
+            amount: Some("250.20".to_string()),
+            shares: None,
+            order_type: crate::cli::BrokerTradeOrderType::Limit,
+            limit_price: Some("12.50".to_string()),
+            stop_price: None,
+            venue: None,
+            confirm: Some("scb1_test".to_string()),
+            accept_unsuitable: false,
+            json: true,
+        };
+
+        let (phase1_input, phase1_intent) =
+            parse_phase1_buy(&phase1_args).expect("phase 1 input should parse");
+        let phase2 = parse_phase2_input_buy(&phase2_args).expect("phase 2 input should parse");
+
+        assert_phase2_matches_phase1_input(TradeSide::Buy, &phase2, &phase1_input)
+            .expect("repeating the amount should match phase 1");
+        let phase2_intent = build_phase2_intent(TradeSide::Buy, &phase2, &phase1_input)
+            .expect("phase 2 intent should build");
+
+        assert_eq!(phase1_input.amount.as_deref(), Some("250.20"));
+        assert_eq!(phase1_input.limit_price.as_deref(), Some("12.50"));
+        assert_eq!(phase1_intent.amount_str.as_deref(), Some("250.2"));
+        assert_eq!(phase1_intent.limit_price_str.as_deref(), Some("12.50"));
+        assert_eq!(phase1_intent.limit_price, Some(12.5));
+        assert_eq!(phase2_intent.amount_str.as_deref(), Some("250.2"));
+        assert_eq!(phase2_intent.limit_price_str.as_deref(), Some("12.50"));
+        assert_eq!(phase2_intent.limit_price, Some(12.5));
+    }
+
+    #[test]
+    fn build_phase2_intent_supports_buy_shares() {
+        let phase2 = Phase2Input {
+            confirmation_id: "scb1_test".to_string(),
+            accept_unsuitable: false,
+            isin: "de0007100000".to_string(),
+            sizing: TradeSizingInput::WholeShares(ParsedWholeSharesInput {
+                raw: "3".to_string(),
+                normalized: "3".to_string(),
+                value: 3,
+            }),
+            venue: Some(" gettex ".to_string()),
+            order_type: ORDER_TYPE_MARKET.to_string(),
+            limit_price: None,
+            stop_price: None,
+            limit_price_value: None,
+            stop_price_value: None,
+        };
+        let phase1 = ConfirmationPhase1Input {
+            side: ORDER_SIDE_BUY.to_string(),
+            isin: "de0007100000".to_string(),
+            amount: None,
+            shares: Some("3".to_string()),
+            venue: Some(" gettex ".to_string()),
+            order_type: ORDER_TYPE_MARKET.to_string(),
+            limit_price: None,
+            stop_price: None,
+        };
+
+        let intent =
+            build_phase2_intent(TradeSide::Buy, &phase2, &phase1).expect("intent should build");
+
+        assert_eq!(intent.isin, "DE0007100000");
+        assert_eq!(intent.amount, None);
+        assert_eq!(intent.shares, Some(NumberOfShares::Whole(3)));
+        assert_eq!(intent.shares_str.as_deref(), Some("3"));
+        assert_eq!(intent.venue_override.as_deref(), Some("GETTEX"));
     }
 
     #[test]
@@ -3450,10 +3813,11 @@ mod tests {
             confirmation_id: "scb1_test".to_string(),
             accept_unsuitable: false,
             isin: "de0007100000".to_string(),
-            amount: Some("500.00".to_string()),
-            amount_value: Some(500.0),
-            shares: None,
-            shares_value: None,
+            sizing: TradeSizingInput::Amount(ParsedNumericInput {
+                raw: "500.00".to_string(),
+                normalized: "500".to_string(),
+                value: 500.0,
+            }),
             venue: None,
             order_type: ORDER_TYPE_MARKET.to_string(),
             limit_price: None,
@@ -3487,7 +3851,7 @@ mod tests {
             resolve_sell_trade_shares(2.5, Some("2.5"), "MUNC", Some(2.5))
                 .expect("shares should resolve");
 
-        assert_eq!(shares, 2.5);
+        assert_eq!(shares, NumberOfShares::Decimal(2.5));
         assert_eq!(shares_str, "2.5");
         assert!(whole);
     }
@@ -3498,7 +3862,7 @@ mod tests {
             resolve_sell_trade_shares(2.0, Some("2"), "MUNC", Some(2.5))
                 .expect("shares should resolve");
 
-        assert_eq!(shares, 2.0);
+        assert_eq!(shares, NumberOfShares::Decimal(2.0));
         assert_eq!(shares_str, "2");
         assert!(!whole);
     }
@@ -3529,10 +3893,11 @@ mod tests {
             confirmation_id: "scb1_test".to_string(),
             accept_unsuitable: false,
             isin: "DE0007100000".to_string(),
-            amount: Some("500".to_string()),
-            amount_value: Some(500.0),
-            shares: None,
-            shares_value: None,
+            sizing: TradeSizingInput::Amount(ParsedNumericInput {
+                raw: "500".to_string(),
+                normalized: "500".to_string(),
+                value: 500.0,
+            }),
             venue: None,
             order_type: ORDER_TYPE_LIMIT.to_string(),
             limit_price: Some("123.45".to_string()),
@@ -3562,10 +3927,11 @@ mod tests {
             confirmation_id: "scb1_test".to_string(),
             accept_unsuitable: false,
             isin: "DE0007100000".to_string(),
-            amount: Some("500".to_string()),
-            amount_value: Some(500.0),
-            shares: None,
-            shares_value: None,
+            sizing: TradeSizingInput::Amount(ParsedNumericInput {
+                raw: "500".to_string(),
+                normalized: "500".to_string(),
+                value: 500.0,
+            }),
             venue: None,
             order_type: ORDER_TYPE_STOP.to_string(),
             limit_price: None,
@@ -3598,10 +3964,11 @@ mod tests {
             confirmation_id: "scb1_test".to_string(),
             accept_unsuitable: false,
             isin: "DE0007100000".to_string(),
-            amount: Some("500".to_string()),
-            amount_value: Some(500.0),
-            shares: None,
-            shares_value: None,
+            sizing: TradeSizingInput::Amount(ParsedNumericInput {
+                raw: "500".to_string(),
+                normalized: "500".to_string(),
+                value: 500.0,
+            }),
             venue: None,
             order_type: ORDER_TYPE_MARKET.to_string(),
             limit_price: None,
@@ -3632,6 +3999,7 @@ mod tests {
         let args = crate::cli::BrokerTradeBuyArgs {
             isin: Some("DE000HSBC123".to_string()),
             amount: Some("500".to_string()),
+            shares: None,
             order_type: crate::cli::BrokerTradeOrderType::Market,
             limit_price: None,
             stop_price: None,
@@ -3648,6 +4016,191 @@ mod tests {
         assert_eq!(intent.isin, "DE000HSBC123");
         assert_eq!(intent.venue_override.as_deref(), Some("GETTEX"));
         assert_eq!(confirmation.isin, "DE000HSBC123");
+    }
+
+    #[test]
+    fn parse_phase1_intent_buy_accepts_shares_input() {
+        let args = crate::cli::BrokerTradeBuyArgs {
+            isin: Some("DE000HSBC123".to_string()),
+            amount: None,
+            shares: Some("3".to_string()),
+            order_type: crate::cli::BrokerTradeOrderType::Market,
+            limit_price: None,
+            stop_price: None,
+            venue: Some("gettex".to_string()),
+            confirm: None,
+            accept_unsuitable: false,
+            json: true,
+        };
+
+        let intent = parse_phase1_intent_buy(&args).expect("phase 1 intent");
+        let confirmation =
+            parse_phase1_input_for_confirmation_buy(&args).expect("phase 1 confirmation input");
+
+        assert_eq!(intent.isin, "DE000HSBC123");
+        assert_eq!(intent.amount, None);
+        assert_eq!(intent.shares, Some(NumberOfShares::Whole(3)));
+        assert_eq!(intent.shares_str.as_deref(), Some("3"));
+        assert_eq!(confirmation.amount, None);
+        assert_eq!(confirmation.shares.as_deref(), Some("3"));
+    }
+
+    #[test]
+    fn parse_phase1_intent_buy_keeps_large_whole_share_input_exact() {
+        let args = crate::cli::BrokerTradeBuyArgs {
+            isin: Some("DE000HSBC123".to_string()),
+            amount: None,
+            shares: Some("9007199254740993".to_string()),
+            order_type: crate::cli::BrokerTradeOrderType::Market,
+            limit_price: None,
+            stop_price: None,
+            venue: None,
+            confirm: None,
+            accept_unsuitable: false,
+            json: true,
+        };
+
+        let intent = parse_phase1_intent_buy(&args).expect("phase 1 intent");
+
+        assert_eq!(
+            intent.shares,
+            Some(NumberOfShares::Whole(9_007_199_254_740_993))
+        );
+        assert_eq!(intent.shares_str.as_deref(), Some("9007199254740993"));
+    }
+
+    #[test]
+    fn parse_phase1_intent_buy_rejects_both_amount_and_shares() {
+        let args = crate::cli::BrokerTradeBuyArgs {
+            isin: Some("DE000HSBC123".to_string()),
+            amount: Some("500".to_string()),
+            shares: Some("3".to_string()),
+            order_type: crate::cli::BrokerTradeOrderType::Market,
+            limit_price: None,
+            stop_price: None,
+            venue: None,
+            confirm: None,
+            accept_unsuitable: false,
+            json: true,
+        };
+
+        let err = parse_phase1_intent_buy(&args).expect_err("xor violation should fail");
+        assert!(err.to_string().contains("--amount or --shares"));
+    }
+
+    #[test]
+    fn parse_phase1_intent_buy_requires_amount_or_shares() {
+        let args = crate::cli::BrokerTradeBuyArgs {
+            isin: Some("DE000HSBC123".to_string()),
+            amount: None,
+            shares: None,
+            order_type: crate::cli::BrokerTradeOrderType::Market,
+            limit_price: None,
+            stop_price: None,
+            venue: None,
+            confirm: None,
+            accept_unsuitable: false,
+            json: true,
+        };
+
+        let err = parse_phase1_intent_buy(&args).expect_err("missing sizing should fail");
+        assert!(err.to_string().contains("--amount or --shares"));
+    }
+
+    #[test]
+    fn parse_phase1_intent_buy_rejects_fractional_shares() {
+        let args = crate::cli::BrokerTradeBuyArgs {
+            isin: Some("DE000HSBC123".to_string()),
+            amount: None,
+            shares: Some("1.5".to_string()),
+            order_type: crate::cli::BrokerTradeOrderType::Market,
+            limit_price: None,
+            stop_price: None,
+            venue: None,
+            confirm: None,
+            accept_unsuitable: false,
+            json: true,
+        };
+
+        let err = parse_phase1_intent_buy(&args).expect_err("fractional shares should fail");
+        assert!(err.to_string().contains("positive whole number"));
+    }
+
+    #[test]
+    fn parse_phase1_intent_buy_rejects_zero_and_negative_shares() {
+        for shares in ["0", "-1"] {
+            let args = crate::cli::BrokerTradeBuyArgs {
+                isin: Some("DE000HSBC123".to_string()),
+                amount: None,
+                shares: Some(shares.to_string()),
+                order_type: crate::cli::BrokerTradeOrderType::Market,
+                limit_price: None,
+                stop_price: None,
+                venue: None,
+                confirm: None,
+                accept_unsuitable: false,
+                json: true,
+            };
+
+            let err = parse_phase1_intent_buy(&args).expect_err("invalid shares should fail");
+            assert!(
+                err.to_string().contains("positive"),
+                "unexpected error for {shares}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_phase2_input_buy_rejects_fractional_shares() {
+        let args = crate::cli::BrokerTradeBuyArgs {
+            isin: Some("DE000HSBC123".to_string()),
+            amount: None,
+            shares: Some("1.5".to_string()),
+            order_type: crate::cli::BrokerTradeOrderType::Market,
+            limit_price: None,
+            stop_price: None,
+            venue: None,
+            confirm: Some("scb1_test".to_string()),
+            accept_unsuitable: false,
+            json: true,
+        };
+
+        let err = parse_phase2_input_buy(&args).expect_err("fractional shares should fail");
+        assert!(err.to_string().contains("positive whole number"));
+    }
+
+    #[test]
+    fn assert_phase2_matches_phase1_rejects_buy_sizing_mode_mismatch() {
+        let phase2 = Phase2Input {
+            confirmation_id: "scb1_test".to_string(),
+            accept_unsuitable: false,
+            isin: "DE0007100000".to_string(),
+            sizing: TradeSizingInput::WholeShares(ParsedWholeSharesInput {
+                raw: "3".to_string(),
+                normalized: "3".to_string(),
+                value: 3,
+            }),
+            venue: None,
+            order_type: ORDER_TYPE_MARKET.to_string(),
+            limit_price: None,
+            stop_price: None,
+            limit_price_value: None,
+            stop_price_value: None,
+        };
+        let phase1 = ConfirmationPhase1Input {
+            side: ORDER_SIDE_BUY.to_string(),
+            isin: "DE0007100000".to_string(),
+            amount: Some("500".to_string()),
+            shares: None,
+            venue: None,
+            order_type: ORDER_TYPE_MARKET.to_string(),
+            limit_price: None,
+            stop_price: None,
+        };
+
+        let err = assert_phase2_matches_phase1_input(TradeSide::Buy, &phase2, &phase1)
+            .expect_err("sizing mode mismatch should fail");
+        assert!(err.to_string().contains("--amount does not match"));
     }
 
     #[test]
@@ -3720,7 +4273,7 @@ mod tests {
             isin: "DE0007100000".to_string(),
             amount: None,
             amount_str: None,
-            shares: Some(9.0),
+            shares: Some(NumberOfShares::Decimal(9.0)),
             shares_str: Some("9".to_string()),
             order_type: ORDER_TYPE_LIMIT.to_string(),
             limit_price: Some(48.5),

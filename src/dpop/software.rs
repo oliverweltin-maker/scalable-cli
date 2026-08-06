@@ -5,7 +5,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use p256::ecdsa::{SigningKey, VerifyingKey};
-use p256::elliptic_curve::rand_core::OsRng;
+use p256::elliptic_curve::Generate;
 use serde::{Deserialize, Serialize};
 
 use super::{DpopKeyMaterial, DpopPublicJwk, DpopSigner};
@@ -32,7 +32,7 @@ impl DpopKeyMaterial {
         }
 
         let material = Self {
-            signer: DpopSigner::Software(SigningKey::random(&mut OsRng)),
+            signer: DpopSigner::Software(SigningKey::generate()),
         };
         material.save_to_file(path)?;
         Ok(material)
@@ -99,7 +99,7 @@ impl DpopKeyMaterial {
 
 pub(super) fn software_public_jwk(signing_key: &SigningKey) -> Result<DpopPublicJwk> {
     let verifying_key = VerifyingKey::from(signing_key);
-    let encoded = verifying_key.to_encoded_point(false);
+    let encoded = verifying_key.to_sec1_point(false);
 
     let x = encoded
         .x()

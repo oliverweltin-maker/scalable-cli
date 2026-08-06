@@ -45,6 +45,13 @@ fn broker_overview_variables_map_input() {
 }
 
 #[test]
+fn broker_overview_query_requests_only_supported_return_fields() {
+    assert!(BROKER_OVERVIEW_QUERY.contains("timeWeightedReturnByTimeframe"));
+    assert!(BROKER_OVERVIEW_QUERY.contains("simpleAbsoluteReturn"));
+    assert!(!BROKER_OVERVIEW_QUERY.contains("performance"));
+}
+
+#[test]
 fn broker_analytics_variables_map_input() {
     let vars = broker_analytics_variables(&broker_input(false, None)).expect("vars");
     assert_eq!(vars["accountId"], "acc-1");
@@ -604,10 +611,41 @@ fn broker_remove_savings_plan_variables_reject_blank_isin() {
 }
 
 #[test]
+fn broker_remove_savings_plan_variables_reject_invalid_isin_checksum() {
+    let err = broker_remove_savings_plan_variables("port-1", "US0378331006").unwrap_err();
+    assert!(err.to_string().contains("field 'isin'"));
+    assert!(err.to_string().contains("valid ISIN"));
+}
+
+#[test]
+fn broker_remove_savings_plan_variables_normalize_lowercase_isin() {
+    let vars = broker_remove_savings_plan_variables("port-1", "us0378331005").expect("vars");
+    assert_eq!(vars["isin"], "US0378331005");
+}
+
+#[test]
 fn broker_savings_plans_variables_map_input() {
     let vars = broker_savings_plans_variables(&broker_input(false, None)).expect("vars");
     assert_eq!(vars["accountId"], "acc-1");
     assert_eq!(vars["portfolioId"], "port-1");
+}
+
+#[test]
+fn broker_savings_plan_ex_ante_cost_variables_preserve_amount_and_fix_munc() {
+    let variables = broker_savings_plan_ex_ante_cost_variables(
+        &broker_input(false, None),
+        "us0378331005",
+        "MONTHLY",
+        "100.50",
+    )
+    .expect("variables");
+
+    assert_eq!(variables["accountId"], "acc-1");
+    assert_eq!(variables["portfolioId"], "port-1");
+    assert_eq!(variables["isin"], "US0378331005");
+    assert_eq!(variables["frequency"], "MONTHLY");
+    assert_eq!(variables["amount"], "100.50");
+    assert_eq!(variables["venue"], "MUNC");
 }
 
 #[test]
@@ -617,6 +655,29 @@ fn broker_savings_plan_config_variables_map_input() {
     assert_eq!(vars["accountId"], "acc-1");
     assert_eq!(vars["portfolioId"], "port-1");
     assert_eq!(vars["isin"], "US0378331005");
+}
+
+#[test]
+fn broker_savings_plan_config_variables_reject_invalid_isin_checksum() {
+    let err = broker_savings_plan_config_variables(&broker_input(false, None), "US0378331006")
+        .unwrap_err();
+    assert!(err.to_string().contains("field 'isin'"));
+    assert!(err.to_string().contains("valid ISIN"));
+}
+
+#[test]
+fn broker_savings_plan_config_variables_normalize_lowercase_isin() {
+    let vars = broker_savings_plan_config_variables(&broker_input(false, None), "us0378331005")
+        .expect("vars");
+    assert_eq!(vars["isin"], "US0378331005");
+}
+
+#[test]
+fn broker_savings_plan_by_isin_variables_reject_invalid_isin_checksum() {
+    let err = broker_savings_plan_by_isin_variables(&broker_input(false, None), "US0378331006")
+        .unwrap_err();
+    assert!(err.to_string().contains("field 'isin'"));
+    assert!(err.to_string().contains("valid ISIN"));
 }
 
 #[test]
@@ -649,6 +710,43 @@ fn broker_create_or_update_savings_plan_variables_map_input() {
         vars["input"]["acknowledgedAppropriatenessWarningVersion"],
         "warn-v1"
     );
+}
+
+#[test]
+fn broker_create_or_update_savings_plan_variables_reject_invalid_isin_checksum() {
+    let err = broker_create_or_update_savings_plan_variables(
+        "port-1",
+        "US0378331006",
+        "100",
+        "MONTHLY",
+        5,
+        "2026-04",
+        "1.5",
+        "REFERENCE_ACCOUNT",
+        None,
+        None,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("field 'isin'"));
+    assert!(err.to_string().contains("valid ISIN"));
+}
+
+#[test]
+fn broker_create_or_update_savings_plan_variables_normalize_lowercase_isin() {
+    let vars = broker_create_or_update_savings_plan_variables(
+        "port-1",
+        "us0378331005",
+        "100",
+        "MONTHLY",
+        5,
+        "2026-04",
+        "1.5",
+        "REFERENCE_ACCOUNT",
+        None,
+        None,
+    )
+    .expect("vars");
+    assert_eq!(vars["input"]["isin"], "US0378331005");
 }
 
 #[test]
@@ -766,12 +864,37 @@ fn broker_query_documents_parse_as_graphql_documents() {
         BROKER_LIMITS_QUERY,
         BROKER_SAVINGS_PLANS_QUERY,
         BROKER_SAVINGS_PLAN_CONFIG_QUERY,
+        BROKER_SAVINGS_PLAN_EX_ANTE_COSTS_QUERY,
         BROKER_CREATE_OR_UPDATE_SAVINGS_PLAN_MUTATION,
         BROKER_SAVINGS_PLAN_BY_ISIN_QUERY,
     ];
 
     for query in queries {
         parse_query::<String>(query).expect("query should parse as valid GraphQL");
+    }
+}
+
+#[test]
+fn broker_savings_plan_ex_ante_query_contains_web_cost_fragment() {
+    for field in [
+        "savingsPlanExAnteCosts",
+        "entryCosts",
+        "ongoingCosts",
+        "exitCosts",
+        "effectOnReturn",
+        "fiveYearsCosts",
+        "incidentalCosts",
+        "initialYearCosts",
+        "followingYearsCosts",
+        "finalYearCosts",
+        "productCosts",
+        "serviceCosts",
+        "percentage",
+    ] {
+        assert!(
+            BROKER_SAVINGS_PLAN_EX_ANTE_COSTS_QUERY.contains(field),
+            "missing {field}"
+        );
     }
 }
 

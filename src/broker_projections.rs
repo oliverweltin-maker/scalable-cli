@@ -37,8 +37,22 @@ pub fn project_broker_overview_response(input: &BrokerInput, response: &Value) -
         },
         "performance": valuation
             .get("timeWeightedReturnByTimeframe")
-            .cloned()
-            .unwrap_or_else(|| Value::Array(Vec::new())),
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|item| {
+                        json!({
+                            "timeframe": item.get("timeframe").cloned().unwrap_or(Value::Null),
+                            "simpleAbsoluteReturn": item
+                                .get("simpleAbsoluteReturn")
+                                .cloned()
+                                .unwrap_or(Value::Null),
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default(),
     }))
 }
 
@@ -1470,6 +1484,7 @@ fn project_broker_remove_price_alert_mutation_response(
     Ok(Value::Object(result))
 }
 
+#[cfg(test)]
 pub fn project_broker_savings_plan_config_response(response: &Value) -> Result<Value> {
     response
         .get("account")
@@ -1484,12 +1499,77 @@ pub fn project_broker_savings_plan_config_response(response: &Value) -> Result<V
         })
 }
 
+pub fn project_broker_savings_plan_ex_ante_costs_response(response: &Value) -> Result<Value> {
+    response
+        .get("account")
+        .and_then(|value| value.get("brokerPortfolio"))
+        .and_then(|value| value.get("savingsPlanExAnteCosts"))
+        .cloned()
+        .ok_or_else(|| {
+            anyhow!(
+                "SAVINGS_PLAN_EX_ANTE_COST_UNAVAILABLE: missing account.brokerPortfolio.savingsPlanExAnteCosts"
+            )
+        })
+}
+
+pub fn project_broker_savings_plan_config_details_response(
+    requested_isin: &str,
+    response: &Value,
+) -> Result<Value> {
+    let security = response
+        .get("account")
+        .and_then(|v| v.get("brokerPortfolio"))
+        .and_then(|v| v.get("security"))
+        .ok_or_else(|| {
+            anyhow!("Broker response invalid: missing account.brokerPortfolio.security")
+        })?;
+
+    let requested_isin = requested_isin.trim();
+    let actual_isin = security
+        .get("isin")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            anyhow!("Broker response invalid: missing account.brokerPortfolio.security.isin")
+        })?;
+    if actual_isin != requested_isin {
+        return Err(anyhow!(
+            "Broker response invalid: requested isin '{requested_isin}' does not match returned security isin '{actual_isin}'"
+        ));
+    }
+
+    let savings_plan_configuration = security
+        .get("savingsPlanConfiguration")
+        .cloned()
+        .ok_or_else(|| {
+            anyhow!(
+                "Broker response invalid: missing account.brokerPortfolio.security.savingsPlanConfiguration"
+            )
+        })?;
+
+    Ok(json!({
+        "security": {
+            "isin": security.get("isin").cloned().unwrap_or(Value::Null),
+            "name": security.get("name").cloned().unwrap_or(Value::Null),
+            "security_type": security.get("type").cloned().unwrap_or(Value::Null),
+        },
+        "savings_plan_configuration": savings_plan_configuration,
+    }))
+}
+
 pub fn project_broker_create_or_update_savings_plan_response(response: &Value) -> Result<Value> {
     let mutation = response
         .get("createOrUpdateSavingsPlan")
+        .and_then(Value::as_object)
         .ok_or_else(|| anyhow!("Broker response invalid: missing createOrUpdateSavingsPlan"))?;
+    let mutation_id = mutation
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+        .ok_or_else(|| anyhow!("Broker response invalid: missing createOrUpdateSavingsPlan.id"))?;
     Ok(json!({
-        "mutation_id": mutation.get("id").cloned().unwrap_or(Value::Null),
+        "mutation_id": mutation_id,
     }))
 }
 

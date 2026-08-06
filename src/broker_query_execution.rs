@@ -3,8 +3,8 @@ use serde_json::{Value, json};
 
 use crate::active_session::load_active_session;
 use crate::broker_shared::{
-    ResolvedBrokerIds, checksum_for_payload, fingerprint_payload_for_transactions_input,
-    resolve_broker_ids, validated_broker_input,
+    broker_result_envelope, fingerprint_payload_for_transactions_input, resolve_broker_ids,
+    validated_broker_input,
 };
 use crate::config::AppConfig;
 use crate::graphql::execute_graphql;
@@ -27,21 +27,11 @@ use crate::helpers::{
     project_broker_security_news_response, project_broker_transaction_details_response,
     project_broker_transactions_response, project_broker_watchlist_response,
 };
+use crate::payload_fingerprint::checksum_for_payload;
 use crate::resolve_active_env;
+use crate::savings_plan_confirmation::inspect_and_clear_matching;
 use crate::session::SessionManager;
 use crate::session_refresh::execute_with_refresh_retry;
-
-fn broker_result_envelope(ids: &ResolvedBrokerIds, result: Value) -> Value {
-    json!({
-        "account_id": ids.account_id,
-        "portfolio_id": ids.portfolio_id,
-        "resolution": {
-            "account": ids.account_source,
-            "portfolio": ids.portfolio_source,
-        },
-        "result": result,
-    })
-}
 
 pub(crate) fn execute_broker_overview(
     args: crate::cli::BrokerOverviewArgs,
@@ -708,7 +698,21 @@ pub(crate) fn execute_broker_savings_plans(
             )
         },
     )?;
-    let projected = project_broker_savings_plans_response(&input, &response)?;
+    let mut projected = project_broker_savings_plans_response(&input, &response)?;
+    if let Some(inspection) =
+        inspect_and_clear_matching(env.as_str(), &ids.account_id, &ids.portfolio_id)?
+        && let Some(result) = projected.as_object_mut()
+    {
+        result.insert(
+            "submission_inspection".to_string(),
+            json!({
+                "cleared_unknown_submission_gate": inspection.cleared_unknown_submission_gate,
+                "isin": inspection.marker.isin,
+                "timestamp_epoch": inspection.marker.timestamp_epoch,
+                "state": inspection.marker.state,
+            }),
+        );
+    }
     Ok(broker_result_envelope(&ids, projected))
 }
 

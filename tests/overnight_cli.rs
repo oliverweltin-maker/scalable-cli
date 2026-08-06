@@ -49,6 +49,28 @@ fn overnight_help_mentions_savings_account_id() {
 }
 
 #[test]
+fn overnight_help_exposes_transactions_and_leaf_options() {
+    let config_dir = temp_config_dir();
+
+    sc_command()
+        .env("SC_CONFIG_DIR", config_dir.path())
+        .args(["overnight", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("transactions"));
+
+    sc_command()
+        .env("SC_CONFIG_DIR", config_dir.path())
+        .args(["overnight", "transactions", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--page-size"))
+        .stdout(predicate::str::contains("--json"))
+        .stdout(predicate::str::contains("Backend transaction type filter"))
+        .stdout(predicate::str::contains("For example"));
+}
+
+#[test]
 fn overnight_json_without_session_returns_machine_envelope() {
     let config_dir = temp_config_dir();
 
@@ -87,4 +109,41 @@ fn capabilities_include_overnight_command() {
         .expect("capabilities commands array");
 
     assert!(commands.contains(&json!("overnight")));
+    assert!(commands.contains(&json!("overnight.transactions")));
+}
+
+#[test]
+fn overnight_transactions_json_without_session_returns_leaf_machine_envelope() {
+    let config_dir = temp_config_dir();
+
+    let assert = sc_command()
+        .env("SC_CONFIG_DIR", config_dir.path())
+        .args(["overnight", "transactions", "--json"])
+        .assert()
+        .failure();
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("utf8 stdout");
+    let envelope: Value = serde_json::from_str(&stdout).expect("machine json envelope");
+
+    assert_eq!(envelope["ok"], json!(false));
+    assert_eq!(envelope["command"], json!("overnight.transactions"));
+    assert_eq!(envelope["error"]["code"], json!("no_session"));
+}
+
+#[test]
+fn overnight_transactions_parse_failure_uses_leaf_machine_envelope() {
+    let config_dir = temp_config_dir();
+
+    let assert = sc_command()
+        .env("SC_CONFIG_DIR", config_dir.path())
+        .args(["overnight", "transactions", "--page-size", "0", "--json"])
+        .assert()
+        .failure();
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("utf8 stdout");
+    let envelope: Value = serde_json::from_str(&stdout).expect("machine json envelope");
+
+    assert_eq!(envelope["ok"], json!(false));
+    assert_eq!(envelope["command"], json!("overnight.transactions"));
+    assert_eq!(envelope["error"]["code"], json!("invalid_input"));
 }
