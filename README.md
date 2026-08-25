@@ -44,6 +44,7 @@ Selenium, browser scraping, or brittle UI scripts.
 1. Tap the repository:
    ```bash
    brew tap ScalableCapital/tap
+   brew trust --formula ScalableCapital/tap/scalable-cli
    ```
 2. Install the CLI:
    ```bash
