@@ -1211,6 +1211,8 @@ query BrokerSavingsPlanExAnteCost($accountId: ID!, $portfolioId: ID!, $isin: Str
 }
 "#;
 
+pub const SAVINGS_PLAN_EXECUTION_VENUE: &str = "SEIX";
+
 pub const BROKER_CREATE_OR_UPDATE_SAVINGS_PLAN_MUTATION: &str = r#"
 mutation BrokerCreateOrUpdateSavingsPlan($portfolioId: ID!, $input: CreateOrUpdateSavingsPlanInput!) {
   createOrUpdateSavingsPlan(portfolioId: $portfolioId, input: $input) {
@@ -1883,7 +1885,7 @@ pub fn broker_savings_plan_ex_ante_cost_variables(
         "isin": isin,
         "frequency": frequency,
         "amount": normalize_positive_decimal_with_field(amount, "amount")?,
-        "venue": "MUNC",
+        "venue": SAVINGS_PLAN_EXECUTION_VENUE,
     }))
 }
 

@@ -631,7 +631,7 @@ fn broker_savings_plans_variables_map_input() {
 }
 
 #[test]
-fn broker_savings_plan_ex_ante_cost_variables_preserve_amount_and_fix_munc() {
+fn broker_savings_plan_ex_ante_cost_variables_preserve_amount_and_use_execution_venue() {
     let variables = broker_savings_plan_ex_ante_cost_variables(
         &broker_input(false, None),
         "us0378331005",
@@ -645,7 +645,7 @@ fn broker_savings_plan_ex_ante_cost_variables_preserve_amount_and_fix_munc() {
     assert_eq!(variables["isin"], "US0378331005");
     assert_eq!(variables["frequency"], "MONTHLY");
     assert_eq!(variables["amount"], "100.50");
-    assert_eq!(variables["venue"], "MUNC");
+    assert_eq!(variables["venue"], "SEIX");
 }
 
 #[test]

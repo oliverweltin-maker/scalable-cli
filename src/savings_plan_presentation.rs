@@ -188,7 +188,7 @@ mod tests {
                 "dynamization_rate": "0",
                 "payment_method": "REFERENCE_ACCOUNT"
             }),
-            "MUNC",
+            "SEIX",
             &json!({"id": "cost-1"}),
             &json!({
                 "id": "scsp1_example",

@@ -36,7 +36,6 @@ fn capabilities_returns_machine_json_envelope() {
 
     assert_eq!(envelope["ok"], json!(true));
     assert_eq!(envelope["command"], json!("capabilities"));
-    assert!(commands.contains(&json!("installation-code")));
     assert!(commands.contains(&json!("login")));
     assert!(commands.contains(&json!("overnight")));
     assert!(commands.contains(&json!("broker.overview")));

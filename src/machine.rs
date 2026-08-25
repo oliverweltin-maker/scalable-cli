@@ -232,17 +232,6 @@ pub fn classify_error(err: &Error) -> ClassifiedError {
         };
     }
 
-    if lower.contains("installation code state") {
-        return ClassifiedError {
-            code: "installation_code_invalid_state",
-            exit_code: 10,
-            hints: vec![
-                "Delete the local installation code file and rerun `sc installation-code`."
-                    .to_string(),
-            ],
-        };
-    }
-
     if lower.contains("unable to resolve broker portfolio id") {
         return ClassifiedError {
             code: "broker_context_missing",
@@ -1073,16 +1062,6 @@ mod tests {
         for (message, code) in cases {
             assert_eq!(classify_error(&anyhow!(message)).code, code);
         }
-    }
-
-    #[test]
-    fn classify_installation_code_invalid_state_error() {
-        let err = anyhow!(
-            "Invalid installation code state at /tmp/sc-installation_code.json: invalid JSON. Delete /tmp/sc-installation_code.json and rerun `sc installation-code`."
-        );
-        let c = classify_error(&err);
-        assert_eq!(c.code, "installation_code_invalid_state");
-        assert_eq!(c.exit_code, 10);
     }
 
     #[test]

@@ -49,14 +49,14 @@ use crate::helpers::{
     BROKER_REMOVE_CRYPTO_PRICE_ALERT_MUTATION, BROKER_REMOVE_FROM_WATCHLIST_MUTATION,
     BROKER_REMOVE_PRICE_ALERT_MUTATION, BROKER_REMOVE_SAVINGS_PLAN_MUTATION,
     BROKER_SAVINGS_PLAN_BY_ISIN_QUERY, BROKER_SAVINGS_PLAN_CONFIG_QUERY,
-    BROKER_SAVINGS_PLAN_EX_ANTE_COSTS_QUERY, broker_add_crypto_price_alert_variables,
-    broker_add_price_alert_variables, broker_add_to_watchlist_variables,
-    broker_create_or_update_savings_plan_variables, broker_crypto_price_alerts_variables,
-    broker_remove_from_watchlist_variables, broker_remove_price_alert_variables,
-    broker_remove_savings_plan_variables, broker_savings_plan_by_isin_variables,
-    broker_savings_plan_config_variables, broker_savings_plan_ex_ante_cost_variables,
-    project_broker_add_crypto_price_alert_response, project_broker_add_price_alert_response,
-    project_broker_create_or_update_savings_plan_response,
+    BROKER_SAVINGS_PLAN_EX_ANTE_COSTS_QUERY, SAVINGS_PLAN_EXECUTION_VENUE,
+    broker_add_crypto_price_alert_variables, broker_add_price_alert_variables,
+    broker_add_to_watchlist_variables, broker_create_or_update_savings_plan_variables,
+    broker_crypto_price_alerts_variables, broker_remove_from_watchlist_variables,
+    broker_remove_price_alert_variables, broker_remove_savings_plan_variables,
+    broker_savings_plan_by_isin_variables, broker_savings_plan_config_variables,
+    broker_savings_plan_ex_ante_cost_variables, project_broker_add_crypto_price_alert_response,
+    project_broker_add_price_alert_response, project_broker_create_or_update_savings_plan_response,
     project_broker_crypto_price_alerts_response, project_broker_remove_crypto_price_alert_response,
     project_broker_remove_price_alert_response, project_broker_remove_savings_plan_response,
     project_broker_savings_plan_by_isin_response,
@@ -2157,7 +2157,7 @@ fn execute_broker_savings_plan_add_phase1(
         &prepared.security,
         prepared.amount.as_str(),
         &prepared.effective_configuration,
-        "MUNC",
+        SAVINGS_PLAN_EXECUTION_VENUE,
         &prepared.costs,
         &confirmation_payload,
     )?;
@@ -2168,7 +2168,7 @@ fn execute_broker_savings_plan_add_phase1(
             "security": prepared.security,
             "input": requested_savings_plan_input(&args, prepared.isin.as_str(), prepared.amount.as_str()),
             "effective_configuration": prepared.effective_configuration,
-            "cost_venue": "MUNC",
+            "cost_venue": SAVINGS_PLAN_EXECUTION_VENUE,
             "ex_ante_costs": prepared.costs,
             "confirmation": confirmation_payload,
             "compliance": savings_plan_compliance_payload(),
@@ -2434,7 +2434,7 @@ fn prepare_savings_plan_add(
         "portfolio_id": ids.portfolio_id,
         "input": requested_savings_plan_input(args, isin.as_str(), amount.as_str()),
         "effective_configuration": effective_configuration,
-        "cost_venue": "MUNC",
+        "cost_venue": SAVINGS_PLAN_EXECUTION_VENUE,
         "ex_ante_costs": costs,
     });
     let snapshot_checksum = checksum_for_payload(&snapshot);
@@ -3358,7 +3358,7 @@ mod tests {
                     "isin": "US0378331005",
                     "frequency": "MONTHLY",
                     "amount": "100",
-                    "venue": "MUNC"
+                    "venue": "SEIX"
                 }
             })))
             .with_status(200)
@@ -3391,7 +3391,8 @@ mod tests {
 
         assert_eq!(result["action"], "preview");
         assert_eq!(result["input"]["isin"], "US0378331005");
-        assert_eq!(result["cost_venue"], "MUNC");
+        assert_eq!(result["cost_venue"], "SEIX");
+        assert_eq!(result["presentation"]["savings_plan"]["cost_venue"], "SEIX");
         assert_eq!(result["ex_ante_costs"], costs);
         assert_eq!(result["next_step"], "confirm_with_id");
         assert!(confirmation_id.starts_with("scsp1_"));
@@ -3405,6 +3406,7 @@ mod tests {
         let stored = load_savings_plan_confirmation(confirmation_id, current_epoch_seconds())
             .expect("stored confirmation");
         assert_eq!(stored.snapshot["input"]["isin"], "US0378331005");
+        assert_eq!(stored.snapshot["cost_venue"], "SEIX");
 
         config_mock.assert();
         costs_mock.assert();

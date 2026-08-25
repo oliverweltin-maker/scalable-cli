@@ -17,7 +17,7 @@ fn non_empty_trimmed_value(raw: &str) -> Result<String, String> {
     about = "Scalable Capital CLI",
     long_about = "Scalable Capital CLI",
     version,
-    after_help = "Examples:\n  sc installation-code\n  sc login\n  sc overnight\n  sc broker context select --portfolio-id <PORTFOLIO_ID>\n  sc broker overview"
+    after_help = "Examples:\n  sc login\n  sc overnight\n  sc broker context select --portfolio-id <PORTFOLIO_ID>\n  sc broker overview"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -27,8 +27,6 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 #[allow(clippy::large_enum_variant)]
 pub enum Commands {
-    #[command(about = "Generate a local installation proof code")]
-    InstallationCode(InstallationCodeArgs),
     #[command(about = "Authenticate and save a session")]
     Login(LoginArgs),
     #[command(about = "Remove a saved session")]
@@ -50,12 +48,6 @@ pub struct LoginArgs {
         help = "Store the session in locally enforced read-only mode for GraphQL mutations"
     )]
     pub local_read_only: bool,
-}
-
-#[derive(Debug, Args)]
-pub struct InstallationCodeArgs {
-    #[arg(long, help = "Print compact JSON")]
-    pub json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -1148,28 +1140,6 @@ mod tests {
                 assert!(!json);
             }
             _ => panic!("whoami command should parse"),
-        }
-    }
-
-    #[test]
-    fn installation_code_parses() {
-        let cli = Cli::parse_from(["sc", "installation-code"]);
-        match cli.command {
-            Commands::InstallationCode(InstallationCodeArgs { json }) => {
-                assert!(!json);
-            }
-            _ => panic!("installation-code should parse"),
-        }
-    }
-
-    #[test]
-    fn installation_code_json_parses() {
-        let cli = Cli::parse_from(["sc", "installation-code", "--json"]);
-        match cli.command {
-            Commands::InstallationCode(InstallationCodeArgs { json }) => {
-                assert!(json);
-            }
-            _ => panic!("installation-code --json should parse"),
         }
     }
 

@@ -1452,6 +1452,13 @@ fn pricing_basis_display_name(basis: &str) -> &'static str {
     }
 }
 
+fn place_order_headers(idempotency_key: &str) -> [(&'static str, &str); 2] {
+    [
+        ("X-SC-Idempotency-Id", idempotency_key),
+        ("X-SC-Order-Origin", "CLI"),
+    ]
+}
+
 fn submit_order(
     prepared: &PreparedTrade,
     confirmation_id: &str,
@@ -1534,7 +1541,7 @@ fn submit_order(
                 &place_order_variables,
                 Some("placeOrder"),
                 access_context,
-                &[("X-SC-Idempotency-Id", attempt.idempotency_key.as_str())],
+                &place_order_headers(&attempt.idempotency_key),
                 dpop_options,
             )
         },
@@ -2153,6 +2160,17 @@ mod tests {
                 _override: crate::channel::TestEnvConfigOverrideGuard::set(env_cfg),
             }
         }
+    }
+
+    #[test]
+    fn place_order_headers_include_idempotency_and_cli_origin() {
+        assert_eq!(
+            place_order_headers("idem-123"),
+            [
+                ("X-SC-Idempotency-Id", "idem-123"),
+                ("X-SC-Order-Origin", "CLI"),
+            ]
+        );
     }
 
     #[test]

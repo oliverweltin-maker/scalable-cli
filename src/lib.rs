@@ -20,7 +20,6 @@ pub mod dpop;
 mod execution_context;
 mod graphql;
 mod helpers;
-mod installation_code;
 mod machine;
 mod overnight_commands;
 mod overnight_projections;
@@ -56,14 +55,12 @@ use crate::broker_context::delete_context as delete_broker_context;
 use crate::cli::{
     BrokerCommand, BrokerContextCommand, BrokerDerivativesCommand, BrokerPortfolioGroupsCommand,
     BrokerPriceAlertsCommand, BrokerSavingsPlansCommand, BrokerTradeCommand,
-    BrokerTransactionCommand, BrokerWatchlistCommand, Cli, Commands, InstallationCodeArgs,
-    OvernightCommand,
+    BrokerTransactionCommand, BrokerWatchlistCommand, Cli, Commands, OvernightCommand,
 };
 use crate::command_handlers::{run_human_whoami_command, run_machine_whoami_command};
 use crate::config::{AppConfig, EnvConfig, TargetEnv};
 use crate::dpop::DpopRuntimeOptions;
 use crate::execution_context::{ExecutionContext, ParseFailureContext};
-use crate::installation_code::load_or_create_installation_code;
 use crate::machine::{print_clap_error, print_error, print_success};
 use crate::overnight_commands::{
     HumanOvernightOutput, run_overnight_command_human, run_overnight_command_machine,
@@ -113,10 +110,6 @@ pub fn run() -> Result<()> {
     };
     let execution_context = ExecutionContext::from_command(&command);
 
-    if let Commands::InstallationCode(args) = command {
-        return run_installation_code_command(args, execution_context);
-    }
-
     let config = AppConfig::load_or_default()?;
     let mut session_manager = SessionManager::new(&config)?;
 
@@ -138,7 +131,6 @@ pub fn run() -> Result<()> {
 
 pub(crate) fn command_requests_json_envelope(command: &Commands) -> bool {
     match command {
-        Commands::InstallationCode(args) => args.json,
         Commands::Login(_) => false,
         Commands::Logout(args) => args.json,
         Commands::Whoami(args) => args.json,
@@ -582,9 +574,6 @@ fn run_human_command(
     session_manager: &mut SessionManager,
 ) -> Result<()> {
     match command {
-        Commands::InstallationCode(_) => {
-            unreachable!("installation-code is handled before config and session initialization")
-        }
         Commands::Login(args) => {
             let env = crate::channel::current_env();
             let env_cfg = crate::channel::current_env_config();
@@ -674,9 +663,6 @@ fn run_machine_command(
     session_manager: &mut SessionManager,
 ) -> Result<Value> {
     match command {
-        Commands::InstallationCode(_) => {
-            unreachable!("installation-code is handled before config and session initialization")
-        }
         Commands::Login(_) => bail!("`login` does not support --json in this version"),
         Commands::Logout(_) => {
             cleanup_local_artifacts_on_logout_best_effort();
@@ -752,7 +738,6 @@ fn machine_capabilities(config: &AppConfig) -> Value {
             "non_interactive_modes": []
         },
         "commands": [
-            "installation-code",
             "login",
             "logout",
             "whoami",
@@ -883,7 +868,6 @@ fn machine_capabilities(config: &AppConfig) -> Value {
 
 pub(crate) fn machine_command_name(command: &Commands) -> &'static str {
     match command {
-        Commands::InstallationCode(_) => "installation-code",
         Commands::Login(_) => "login",
         Commands::Logout(_) => "logout",
         Commands::Whoami(_) => "whoami",
@@ -945,35 +929,6 @@ pub(crate) fn machine_command_name(command: &Commands) -> &'static str {
         },
         Commands::Capabilities(_) => "capabilities",
     }
-}
-
-fn run_installation_code_command(
-    args: InstallationCodeArgs,
-    execution_context: ExecutionContext,
-) -> Result<()> {
-    let value = match load_or_create_installation_code() {
-        Ok(value) => value,
-        Err(err) if execution_context.requests_machine_output() => {
-            let exit_code = print_error(execution_context.command_name, &err);
-            std::process::exit(exit_code);
-        }
-        Err(err) => return Err(err),
-    };
-
-    if args.json {
-        print_success(
-            execution_context.command_name,
-            json!({
-                "installation_code": value.installation_code,
-                "display_code": value.display_code,
-            }),
-        );
-    } else {
-        println!("Installation code: {}", value.display_code);
-        println!("Send this code to Scalable to request access to the allowlist.");
-    }
-
-    Ok(())
 }
 
 pub(crate) fn print_whoami_text(result: &Value) -> Result<()> {

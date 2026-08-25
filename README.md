@@ -82,24 +82,11 @@ sc --help
 
 ## Quick start
 
-Scalable CLI is currently in beta and we do not offer active support.
+Scalable CLI is the official command line for the Scalable Broker.
 
-Clients need to be allowlisted before they can log in.
-
-Generate your installation code:
-
-```bash
-sc installation-code
-```
-
-`sc installation-code` works without login.
-
-Then, send us an email to [cli.beta@scalable.capital](mailto:cli.beta@scalable.capital) from the email address used for your Scalable account.
-Use the subject `Scalable CLI Allowlisting` and include the installation code in
-the message body.
-
-After you have been allowlisted, authenticate and confirm the CLI can access
-your Scalable Broker account:
+Before you authenticate, enable Scalable CLI in your profile on the Scalable
+web platform. Then authenticate and confirm the CLI can access your Scalable
+Broker account:
 
 ```bash
 sc login
@@ -306,7 +293,7 @@ sc broker savings-plans remove --isin US0378331005
 ```
 
 Savings-plan additions and updates are intentionally two-step. Phase 1 returns
-the full ex-ante cost disclosure calculated for `MUNC`, together with a
+the full ex-ante cost disclosure calculated for `SEIX`, together with a
 short-lived confirmation ID. Present every value in that disclosure to the
 client, obtain an explicit affirmative response in a separate interaction,
 then repeat the exact arguments with `--confirm <CONFIRMATION_ID>`.
